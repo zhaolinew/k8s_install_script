@@ -4,3 +4,4 @@ k8s二进制安装部署脚本
 - centos 7
 - centos 8
 - ubuntu 18.x
+- centos 6
