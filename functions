@@ -1,0 +1,2670 @@
+#!/bin/bash
+
+####################################################################
+#运行前预检查服务，不符合条件将会给提示信息                            #
+####################################################################
+function init_pre_check(){
+    # 检查主机的名称是不是合法，当主机名称中有下划线时(_)，kublet会起动失败
+    switch_check=yes
+    for (( i=0; i < "${#NAMES[@]}"; i++ )); do
+        #  if [[ ! ${node_name} =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; then  
+        if [[ ! "${NAMES[i]}" =~ ^[a-zA-Z0-9]+([.|-]?[a-zA-Z0-9]+)*$ ]]; then
+            BAD_NAMES[${#BAD_NAMES[*]}]=${NAMES[i]}
+            switch_check=no
+        fi
+    done
+
+    if [ "$switch_check" = no ]; then
+        echo "主机名称${BAD_NAMES[@]}不合法"
+        echo "不能使用_及其它特殊字符，可以使用-或. 请重新定义名称"
+        exit 1
+    fi
+
+    # 去重复的IP，在配置文件中定义 master 和 etcd 在同一个节点时,
+    # 只对其中的一个节做准备工作，否则会出现一个IP重复准备工作。
+    for (( i=0; i < "${#IPS[@]}"; i++ )); do
+        switch=no
+        for (( j=$[i+1]; j< "${#IPS[@]}"; j++ )); do
+            if [ ${IPS[i]} = ${IPS[j]} ]; then
+            switch=yes
+            fi
+        done
+
+        if [ "$switch" = no ]; then
+            NEW_IPS[${#NEW_IPS[*]}]=${IPS[i]}
+        fi
+    done
+}
+
+##########################################################
+# install expect for master1,只需要在操作的主机上安装即可  #
+##########################################################
+function init_install_expect(){
+    if rpm -q expect &>/dev/null; then
+        #  echo "expect installed already"
+        :
+    else
+        gecho ">>> install expect"
+        echo -n "installing expect..."
+        yum clean all &>/dev/null
+        yum repolist &>/dev/null
+        if yum install -y expect &>/dev/null; then
+            gecho "successful"
+        else
+            recho "failed"
+            exit 1
+        fi
+    fi
+}
+
+
+#############################################
+#generate key from localhost                #
+#############################################
+function init_ssh_key(){
+    read -s -p "input root password for host:" root_pass
+    clear
+    gecho ">>> Generate key"
+    echo -e -n "Generate key for localhost..." 
+    if [ -e /root/.ssh/id_rsa ]; then
+        echo -e " key has exist"
+    else
+        if ssh-keygen -t rsa -N '' -f /root/.ssh/id_rsa -q; then
+            echo -e " finished!"
+        else
+            echo -e " failed!"
+        fi
+    fi
+
+#copy key to hosts
+gecho ">>> start copy key to hosts"
+for host_ip in ${NEW_IPS[@]} ; do 
+echo -e -n "coping file to ${host_ip}...,"
+expect >/dev/null 2>&1 <<EOF
+set timeout 5
+spawn ssh-copy-id root@${host_ip}
+expect {
+    "yes/no" { send "yes\n";exp_continue }
+    "password:" { send "${root_pass}\n" }
+}
+expect eof
+EOF
+    if [ $? -eq 0 ]; then 
+        echo -e " finish!"
+    else
+        echo -e " skiped!"
+    fi
+done
+}
+
+#############################################################################
+# 设置主机记录hosts文件，包括所有的主机记录，
+# 如果不设置可能无法使用kubectl exec命令，当然也可以使用DNS
+# or 如果kube-apiserver使用参数 --kubelet-preferred-address-types=InternalIP 
+# ( Default: "Hostname,InternalDNS,InternalIP,ExternalDNS,ExternalIP" ) 
+# 则可以不用hosts文件解析kublet节点的主机名
+#############################################################################
+function init_set_hosts(){
+    gecho ">>> adding host records to /etc/hosts"
+    for node_ip in ${MASTER_IPS[@]} ${NODE_IPS[@]}; do
+        if [ -n "${KUBE_APISERVER_DNS_NAME}" ]; then
+            if [ -z "${KUBE_APISERVER_IP}" ]; then
+                recho "please add KUBE_APISERVER_IP in configfile"
+                exit 1
+            fi
+            if ssh -o StrictHostKeyChecking=no root@${node_ip} "grep "${KUBE_APISERVER_IP}" /etc/hosts | grep "${KUBE_APISERVER_DNS_NAME}" >/dev/null 2>&1"; then
+                echo "host record ${KUBE_APISERVER_IP} ${KUBE_APISERVER_DNS_NAME} existed...!"
+            else
+                echo -e -n "adding host record ${KUBE_APISERVER_IP} ${KUBE_APISERVER_DNS_NAME} to host ${node_ip}..."
+                if ssh -o StrictHostKeyChecking=no root@${node_ip} "echo "${KUBE_APISERVER_IP} ${KUBE_APISERVER_DNS_NAME}" >> /etc/hosts"; then
+                    gecho "successful"
+                else
+                    recho "failed"
+                fi
+            fi
+        fi
+    done
+}
+
+####################################################
+#设置环境变脸及安装初始化的软件                       #
+####################################################
+function init_set_env(){
+cat > ${WORK_DIR}/kubernetes.conf <<EOF
+# 路由转发功能，默认为0是关闭的，如需要打开需要更改为1。
+net.ipv4.ip_forward=1
+
+# 能够更快的回收TIME-WAIT。默认值为1。
+#net.ipv4.tcp_tw_recycle=0
+
+# 存在于ARP高速缓存中的最少层数。如果少于这个数，垃圾收集器将不会运行，缺省值是128。
+net.ipv4.neigh.default.gc_thresh1=1024
+
+# 保存在ARP高速缓存中的最多记录软限制，垃圾收集器在开始收集前，允许记录数超过这个数字5秒。缺省值5121
+net.ipv4.neigh.default.gc_thresh2=2048
+
+# 保存在ARP高速缓存中的最多纪录的硬限制，一旦高速缓存中的数目高于此垃圾收集器将马上进行。缺省值为1024
+net.ipv4.neigh.default.gc_thresh3=4096
+
+# 减少系统对于swap频繁的写入，将加快应用程序之间的切换，有助于提升系统性能。默认值为60。
+vm.swappiness=0
+
+# 该文件指定了内核针对内存分配的策略，其值可是0、1、2。
+# 0， 表示内核将检查是否有足够的可用内存供应用进程使用；如果有足够的可用内存，内存申请允许；否则，内存申请失败，并把错误返回给应用进程。
+# 1， 表示内核允许分配所有的物理内存，而不管当前的内存状态如何。
+# 2， 表示内核允许分配超过所有物理内存和交换空间总和的内存
+vm.overcommit_memory=1
+
+# panic_on_oom这个参数就是控制遇到OOM的时候，系统如何反应的。当该参数等于0的时候，表示选择积极面对人生，启动OOM killer。
+# 当该参数等于2的时候，表示无论是哪一种情况，都强制进入kernel panic。
+vm.panic_on_oom=0
+
+# 表示每一个real user ID可创建的inotify instatnces的数量上限，默认128.
+fs.inotify.max_user_instances=8192
+
+# 表示同一用户同时可以添加的watch数目（watch一般是针对目录，决定了同时同一用户可以监控的目录数量）
+fs.inotify.max_user_watches=1048576
+
+# 该文件指定了可以分配的文件句柄的最大数目。默认值为4096
+fs.file-max=52706963
+
+# 是单个进程可分配的最大文件数
+fs.nr_open=52706963
+
+# 禁用IPv6
+net.ipv6.conf.all.disable_ipv6=1
+
+# 是内核模块中的连接追踪模块
+net.netfilter.nf_conntrack_max=2310720
+
+# 二层的网桥在转发包时也会被iptables的FORWARD规则所过滤, 这样就会出现L3层的iptables rules去过滤L2的帧的问题
+net.bridge.bridge-nf-call-iptables=1
+net.bridge.bridge-nf-call-ip6tables=1
+EOF
+
+for host_ip in ${NEW_IPS[@]} ; do
+    gecho ">>> initialize environment on ${host_ip}"
+
+    echo -n "setup PATH environment variable..."
+    if ssh root@${host_ip} "grep 'export PATH=/opt/k8s/bin:/opt/containerd/bin:/opt/dockerd/bin:\$PATH' /etc/profile >/dev/null 2>&1"; then
+        gecho "exist already"
+    else
+        ssh root@${host_ip} "echo 'export PATH=/opt/k8s/bin:/opt/containerd/bin:/opt/dockerd/bin:\$PATH' >>/etc/profile" 
+        gecho "successful"
+    fi
+
+    echo -n "install necessary software..."
+    if ssh root@${host_ip} "yum install -y conntrack ipvsadm ipset iptables curl sysstat libseccomp wget socat git bash-completion > /dev/null 2>&1"; then
+        gecho "successful"
+    else
+        recho "failed"
+        exit 1
+    fi
+    if [[ "${MASTER_IPS[@]}" =~ "$host_ip" ]]; then
+        echo -n "setup bash completion..."
+        if ssh root@${host_ip} "grep 'source /usr/share/bash-completion/bash_completion' /etc/profile >/dev/null 2>&1"; then
+            gecho "exist already"
+        else
+            ssh root@${host_ip} "echo 'source /usr/share/bash-completion/bash_completion' >> /etc/profile"
+            gecho "successful"
+        fi
+
+        echo -n "setup kubeclt completion..."
+        if ssh root@${host_ip} "grep 'source <(kubectl completion bash)' /etc/profile > /dev/null 2>&1"; then
+            gecho "exist aready"
+        else
+            ssh root@${host_ip} "echo 'source <(kubectl completion bash)' >> /etc/profile"
+            gecho "successful"
+        fi
+    fi
+
+    echo -n "Disable firewall..."
+    if ssh -o StrictHostKeyChecking=no root@${host_ip} "systemctl stop firewalld && systemctl disable firewalld"; then
+        gecho "successful"
+    else
+        recho "failed"
+        exit 1
+    fi
+
+    echo -n "flush iptables..."
+    if ssh -o StrictHostKeyChecking=no root@${host_ip} "iptables -F && iptables -X && iptables -F -t nat && iptables -X -t nat &&iptables -P FORWARD ACCEPT"; then
+        gecho "successful"
+    else
+        recho "failed"
+        exit 1
+    fi
+
+    echo -n "disable swap..."
+    if ssh -o StrictHostKeyChecking=no root@${host_ip} "sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab && swapoff -a"; then
+        gecho "successful"
+    else
+        recho "failed"
+        exit 1
+    fi
+
+    echo -n "disable SELINUX..."
+    if ssh -o StrictHostKeyChecking=no root@${host_ip} "sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config"; then
+        gecho "successful"
+        setenforce 0 &> /dev/null
+    else
+        recho "failed"
+        exit 1
+    fi
+
+    echo -n "apply conf file..." 
+    if scp ${WORK_DIR}/kubernetes.conf root@${host_ip}:/etc/sysctl.d/kubernetes.conf >/dev/null 2>&1; then
+        if ssh -o StrictHostKeyChecking=no root@${host_ip} "modprobe br_netfilter && sysctl -p /etc/sysctl.d/kubernetes.conf >/dev/null 2>&1"; then 
+            gecho "successful"
+        else
+            recho "ssh failed"
+            exit 1
+        fi
+    else 
+        recho "scp failed"
+        exit 1
+    fi
+
+    # timedatectl set-timezone Asia/Shanghai
+    echo -n "create directory..." 
+    if ssh -o StrictHostKeyChecking=no root@${host_ip} "mkdir -p /opt/k8s/{bin,cert,conf}"; then
+        gecho "successful"
+    else
+        recho "failed"
+        exit 1
+    fi
+done
+}
+
+####################################################
+#获取cfssl执行文件                                  #
+####################################################
+function cfssl_get(){
+    becho ">>> 下载和安装 cfssl 工具集"
+    echo -n "下载cfssl文件..."
+    if [ ! -f /opt/k8s/bin/cfssl ]; then
+        wget ${GET_CFSSL} -O /opt/k8s/bin/cfssl
+    fi
+
+    if [ $? -eq 0 ]; then
+        gecho "成功！"
+        chmod +x /opt/k8s/bin/cfssl
+    else
+        recho "下载cfssl失败，请检查链接或网络!"
+        exit 1
+    fi
+
+    echo -n "下载cfssljson文件..."
+    if [ ! -f /opt/k8s/bin/cfssljson ]; then
+        wget ${GET_CFSSLJSON} -O /opt/k8s/bin/cfssljson
+    fi
+    if [ $? -eq 0 ]; then
+        gecho "成功！"
+        chmod +x /opt/k8s/bin/cfssljson
+    else
+        recho "下载cfssljson失败，请检查链接或网络!"
+        exit 1
+    fi
+
+    echo -n "下载cfssl_certinfo文件..."
+    if [ ! -f /opt/k8s/bin/cfssl-certinfo ]; then
+        wget ${GET_CFSSL_CERTINFO} -O /opt/k8s/bin/cfssl-certinfo
+    fi
+
+    if [ $? -eq 0 ]; then
+        gecho "成功！"
+        chmod +x /opt/k8s/bin/cfssl-certinfo
+    else
+        recho "下载失败，请检查链接或网络!"
+        exit 1
+    fi
+}
+
+####################################################
+# 创建证书的配置文件                                 #
+####################################################
+function ca_setup(){
+cat > $WORK_DIR/ca-config.json <<EOF
+{
+  "signing": {
+    "default": {
+      "expiry": "87600h"
+    },
+    "profiles": {
+      "kubernetes": {
+        "usages": [
+            "signing",
+            "key encipherment",
+            "server auth",
+            "client auth"
+        ],
+        "expiry": "876000h"
+      }
+    }
+  }
+}
+EOF
+
+# 创建 CA 证书请求文件
+cat > ${WORK_DIR}/ca-csr.json <<EOF
+{
+  "CN": "kubernetes-ca",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "CN",
+      "ST": "BeiJing",
+      "L": "BeiJing",
+      "O": "k8s",
+      "OU": "${CSR_OU}"
+    }
+  ],
+  "ca": {
+    "expiry": "876000h"
+ }
+}
+EOF
+becho ">>> 生成 CA 证书和私钥"
+echo -n "生成证书..."
+cfssl gencert -initca ${WORK_DIR}/ca-csr.json | cfssljson -bare ${WORK_DIR}/ca
+[ $? -eq 0 ] && gecho ">>> 证书生成成功!" || recho ">>> 证书生成失败！请检查原因"
+# 分发 CA 证书文件
+for node_ip in ${MASTER_IPS[@]}; do
+    gecho ">>> 复制以下文件到${node_ip}"
+    ssh root@${node_ip} "mkdir -p /opt/k8s/cert"
+    scp ${WORK_DIR}/ca*.pem root@${node_ip}:/opt/k8s/cert
+done
+for node_ip in ${NODE_IPS[@]} ${ETCD_IPS[@]}; do
+    gecho ">>> 复制以下文件到${node_ip}"
+    ssh root@${node_ip} "mkdir -p /opt/k8s/cert"
+    scp ${WORK_DIR}/ca.pem root@${node_ip}:/opt/k8s/cert
+done
+}
+
+
+#########################################################################
+# 分发kubectl、创建证书、创建和分发kubeconfig文件                          #
+#########################################################################
+function kubectl_setup(){
+becho ">>> 安装 kubectl 二进制文件并生成 kubeconfig 文件"
+echo -n "下载和分发 kubectl 二进制文件..."
+if [ ! -f ${WORK_DIR}/${KUBERNETES_SERVER} ]; then
+  if wget ${GET_KUBERNETES_SERVER} -O ${WORK_DIR}/${KUBERNETES_SERVER}; then
+    if tar -xf ${WORK_DIR}/${KUBERNETES_SERVER} -C ${WORK_DIR}; then
+      gecho "成功！"
+    else
+      recho "失败！"
+      exit 1
+    fi
+  else
+    recho "失败！"
+    exit 1
+  fi
+else
+  if tar -xf ${WORK_DIR}/${KUBERNETES_SERVER} -C ${WORK_DIR}; then
+    gecho "成功！"
+  else
+    recho "失败！"
+    exit 1
+  fi
+fi
+
+# 创建 admin 证书和私钥
+becho ">>> 生成admin证书和私钥"
+cat > ${WORK_DIR}/admin-csr.json <<EOF
+{
+  "CN": "admin",
+  "hosts": [],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "CN",
+      "ST": "BeiJing",
+      "L": "BeiJing",
+      "O": "system:masters",
+      "OU": "${CSR_OU}"
+    }
+  ]
+}
+EOF
+
+for node_ip in ${MASTER_IPS[@]}; do
+    gecho "复制以下文件到 ${node_ip}"
+    scp ${WORK_DIR}/kubernetes/server/bin/kubectl root@${node_ip}:/opt/k8s/bin/
+    ssh root@${node_ip} "chmod +x /opt/k8s/bin/kubectl"
+  done
+
+gecho ">>> 生成admin证书和私钥..."
+cfssl gencert -ca=${WORK_DIR}/ca.pem \
+  -ca-key=${WORK_DIR}/ca-key.pem \
+  -config=${WORK_DIR}/ca-config.json \
+  -profile=kubernetes ${WORK_DIR}/admin-csr.json | cfssljson -bare ${WORK_DIR}/admin
+[ $? -eq 0 ] && gecho "成功!" || recho "失败！请检查原因"
+
+becho ">>> 创建 kubeconfig 文件"
+## 设置集群参数
+echo -n "创建 kubeconfig 文件..."
+kubectl config set-cluster kubernetes \
+  --certificate-authority=${WORK_DIR}/ca.pem \
+  --embed-certs=true \
+  --server=${KUBE_APISERVER} \
+  --kubeconfig=${WORK_DIR}/kubectl.kubeconfig
+## 设置客户端认证参数
+kubectl config set-credentials admin \
+  --client-certificate=${WORK_DIR}/admin.pem \
+  --client-key=${WORK_DIR}/admin-key.pem \
+  --embed-certs=true \
+  --kubeconfig=${WORK_DIR}/kubectl.kubeconfig
+## 设置上下文参数
+kubectl config set-context kubernetes \
+  --cluster=kubernetes \
+  --user=admin \
+  --kubeconfig=${WORK_DIR}/kubectl.kubeconfig
+## 设置默认上下文
+kubectl config use-context kubernetes --kubeconfig=${WORK_DIR}/kubectl.kubeconfig
+if [ $? -eq 0 ]; then
+  gecho "配置文件生成成功!"
+else 
+  recho "配置生成失败！请检查原因."
+fi
+
+# becho ">>> 分发 kubeconfig 文件"
+for node_ip in ${MASTER_IPS[@]}; do
+    gecho ">>> 复制以下文件到 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p ~/.kube"
+    scp ${WORK_DIR}/kubectl.kubeconfig root@${node_ip}:~/.kube/config
+  done
+}
+
+##############################################################################
+# 下载和分发 etcd 二进制文件
+##############################################################################
+function etcd_get(){
+becho ">>> 初始化和安装ETCD群集..."
+if [ ! -f ${WORK_DIR}/${ETCD_PKGS} ]; then
+  wget ${GET_ETCD_PKGS} -O ${WORK_DIR}/${ETCD_PKGS}
+fi
+if [ ! $? -eq 0 ]; then
+  recho ">>> 下载失败，请检查链接或网络!"
+  exit 1
+fi
+if tar -xzf ${WORK_DIR}/${ETCD_PKGS} -C ${WORK_DIR}; then
+  pass
+else
+  recho "解压缩失败！ 退出。"
+  exit 1
+fi
+
+
+ETCD_DIR=`echo ${ETCD_PKGS} | rev | cut -d. -f3- | rev`
+for node_ip in ${ETCD_IPS[@]}; do
+    gecho ">>> 分发ETCD二进制文件到节点${node_ip}"
+    scp ${WORK_DIR}/${ETCD_DIR}/etcd* root@${node_ip}:/opt/k8s/bin
+    ssh root@${node_ip} "chmod +x /opt/k8s/bin/*"
+  done
+}
+
+####################################################
+# 创建 etcd 证书和私钥
+####################################################
+function etcd_cert(){
+gecho ">>> 创建ETCD证书签名请求..."
+cat > ${WORK_DIR}/etcd-csr.json <<EOF
+{
+  "CN": "etcd",
+  "hosts": [
+    "127.0.0.1",
+  ],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "CN",
+      "ST": "BeiJing",
+      "L": "BeiJing",
+      "O": "k8s",
+      "OU": "${CSR_OU}"
+    }
+  ]
+}
+EOF
+
+# 将IP添加到证书的hosts字段中
+for (( i=0; i < "${#ETCD_IPS[@]}"; i++ ))
+do
+  if [ "${i}" -eq 0 ]; then
+    sed -i '4a'"\    \"${ETCD_IPS[i]}\""'' ${WORK_DIR}/etcd-csr.json
+  else
+    sed -i '4a'"\    \"${ETCD_IPS[i]}\","'' ${WORK_DIR}/etcd-csr.json
+  fi
+done                               
+
+## 生成ETCD证书和私钥
+gecho ">>> 生成ETCD证书和私钥..."
+cfssl gencert -ca=${WORK_DIR}/ca.pem \
+    -ca-key=${WORK_DIR}/ca-key.pem \
+    -config=${WORK_DIR}/ca-config.json \
+    -profile=kubernetes ${WORK_DIR}/etcd-csr.json | cfssljson -bare ${WORK_DIR}/etcd
+
+if [ $? -eq 0 ]; then
+  gecho ">>> 证书生成成功!"
+else
+  recho ">>> 证书生成失败！请检查原因"
+  exit 1
+fi
+
+## 分发生成的证书和私钥到各 etcd 节点：
+for node_ip in ${ETCD_IPS[@]}
+  do
+    gecho ">>> 分发生成的ETCD证书和私钥到到 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p /opt/k8s/cert"
+    scp ${WORK_DIR}/etcd*.pem root@${node_ip}:/opt/k8s/cert/
+  done
+}
+
+#创建 etcd 的 systemd unit 模板文件
+function etcd_systemd(){
+cat > ${WORK_DIR}/etcd.service.template <<EOF
+[Unit]
+Description=Etcd Server
+After=network.target
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/coreos
+[Service]
+Type=notify
+WorkingDirectory=${ETCD_DATA_DIR}
+ExecStart=/opt/k8s/bin/etcd \\
+  --data-dir=${ETCD_DATA_DIR} \\
+  --wal-dir=${ETCD_WAL_DIR} \\
+  --name=##NODE_NAME## \\
+  --cert-file=/opt/k8s/cert/etcd.pem \\
+  --key-file=/opt/k8s/cert/etcd-key.pem \\
+  --trusted-ca-file=/opt/k8s/cert/ca.pem \\
+  --peer-cert-file=/opt/k8s/cert/etcd.pem \\
+  --peer-key-file=/opt/k8s/cert/etcd-key.pem \\
+  --peer-trusted-ca-file=/opt/k8s/cert/ca.pem \\
+  --peer-client-cert-auth \\
+  --client-cert-auth \\
+  --listen-peer-urls=https://##NODE_IP##:2380 \\
+  --initial-advertise-peer-urls=https://##NODE_IP##:2380 \\
+  --listen-client-urls=https://##NODE_IP##:2379,http://127.0.0.1:2379 \\
+  --advertise-client-urls=https://##NODE_IP##:2379 \\
+  --initial-cluster-token=etcd-cluster-0 \\
+  --initial-cluster=${ETCD_NODES} \\
+  --initial-cluster-state=new \\
+  --auto-compaction-mode=periodic \\
+  --auto-compaction-retention=1 \\
+  --max-request-bytes=33554432 \\
+  --quota-backend-bytes=6442450944 \\
+  --heartbeat-interval=250 \\
+  --election-timeout=2000
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 替换配置文件的变量
+for (( i=0; i < "${#ETCD_IPS[@]}"; i++ ))
+  do
+    sed -e "s/##NODE_NAME##/${ETCD_NAMES[i]}/" -e "s/##NODE_IP##/${ETCD_IPS[i]}/" ${WORK_DIR}/etcd.service.template > ${WORK_DIR}/etcd-${ETCD_IPS[i]}.service 
+  done
+
+# 为各节点创建和分发 etcd systemd unit 文件并启动服务
+for node_ip in ${ETCD_IPS[@]}
+  do
+    gecho ">>> 创建和分发 etcd systemd unit 文件到 ${node_ip}"
+    scp ${WORK_DIR}/etcd-${node_ip}.service root@${node_ip}:/etc/systemd/system/etcd.service
+
+    gecho ">>> 启动etcd服务 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p ${ETCD_DATA_DIR} ${ETCD_WAL_DIR}"
+    ssh root@${node_ip} "systemctl daemon-reload && systemctl enable etcd && systemctl restart etcd " &
+    sleep 5
+	
+    gecho ">>> 检查启动结果 ${node_ip}"
+    ssh root@${node_ip} "systemctl status etcd|grep Active"
+done
+gecho ">>> 验证服务状态 ${node_ip}"
+ssh root@${node_ip} "/opt/k8s/bin/etcdctl \
+  --endpoints=https://${node_ip}:2379 \
+  --cacert=/opt/k8s/cert/ca.pem \
+  --cert=/opt/k8s/cert/etcd.pem \
+  --key=/opt/k8s/cert/etcd-key.pem endpoint health && \
+  /opt/k8s/bin/etcdctl \
+  -w table --cacert=/opt/k8s/cert/ca.pem \
+  --cert=/opt/k8s/cert/etcd.pem \
+  --key=/opt/k8s/cert/etcd-key.pem \
+  --endpoints=${ETCD_ENDPOINTS} endpoint status"
+}
+
+#########################################################
+#下载master的文件并分发到master上
+#########################################################
+# 将二进制文件拷贝到所有 master 节点：
+function kubernetes_get(){
+    for node_ip in ${MASTER_IPS[@]}; do
+        gecho ">>> 将二进制文件拷贝到 master 节点${node_ip}"
+        scp ${WORK_DIR}/kubernetes/server/bin/{apiextensions-apiserver,kube-apiserver,kube-controller-manager,kube-scheduler} root@${node_ip}:/opt/k8s/bin/
+        ssh root@${node_ip} "chmod +x /opt/k8s/bin/*"
+    done
+}
+
+
+#######################################################
+#创建 kubernetes-master 证书和私钥
+######################################################
+function kubeapi_cert(){
+cat > ${WORK_DIR}/kubernetes-csr.json <<EOF
+{
+  "CN": "kubernetes-master",
+  "hosts": [
+    "127.0.0.1",
+    "${CLUSTER_KUBERNETES_SVC_IP}",
+    "kubernetes",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+    "kubernetes.default.svc.cluster",
+    "kubernetes.default.svc.cluster.local.",
+    "kubernetes.default.svc.${CLUSTER_DNS_DOMAIN}.",
+    "${KUBE_APISERVER_DNS_NAME}"
+  ],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "CN",
+      "ST": "BeiJing",
+      "L": "BeiJing",
+      "O": "k8s",
+      "OU": "${CSR_OU}"
+    }
+  ]
+}
+EOF
+
+# 将IP地址插入到证书文件中的hosts
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ ))
+do
+    sed -i '4a'"\    \"${MASTER_IPS[i]}\","'' ${WORK_DIR}/kubernetes-csr.json
+done                      
+
+# 生成证书和私钥：
+gecho ">>> 生成证书和私钥..."
+cfssl gencert -ca=${WORK_DIR}/ca.pem \
+  -ca-key=${WORK_DIR}/ca-key.pem \
+  -config=${WORK_DIR}/ca-config.json \
+  -profile=kubernetes ${WORK_DIR}/kubernetes-csr.json | cfssljson -bare ${WORK_DIR}/kubernetes
+
+if [ $? -eq 0 ]; then
+  gecho ">>> 证书生成成功!"
+else
+  recho ">>> 证书生成失败！请检查原因"
+  exit 1
+fi
+
+# 将生成的证书和私钥文件拷贝到所有 master 节点：
+for node_ip in ${MASTER_IPS[@]}
+  do
+    gecho ">>> 分发生成的证书和私钥到到 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p /opt/k8s/cert"
+    scp ${WORK_DIR}/kubernetes*.pem root@${node_ip}:/opt/k8s/cert/
+  done
+}
+
+
+##################################################
+#创建加密配置文件
+###############################################
+kubeapi_encry(){
+cd ${WORK_DIR}
+cat > encryption-config.yaml <<EOF
+kind: EncryptionConfig
+apiVersion: v1
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: ${ENCRYPTION_KEY}
+      - identity: {}
+EOF
+# 将加密配置文件拷贝到 master 节点的 /opt/k8s 目录下：
+cd ${WORK_DIR}
+for node_ip in ${MASTER_IPS[@]}
+  do
+    gecho ">>> 将加密配置文件拷贝到 master 节点的 ${node_ip} /opt/k8s/conf 目录下"
+    scp ${WORK_DIR}/encryption-config.yaml root@${node_ip}:/opt/k8s/conf
+  done
+}
+
+#################################################################
+#创建审计策略文件
+#################################################################
+kubeapi_audit(){
+# 注：此审计文件版本不同可能接受参数不同，所以要查官方文档，参考文档：
+# https://kubernetes.io/zh/docs/tasks/debug-application-cluster/audit/
+# GCE 使用的审计配置文件
+# https://github.com/kubernetes/kubernetes/blob/master/cluster/gce/gci/configure-helper.sh#L735
+
+cat <<EOF >${WORK_DIR}/audit-policy.yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  # The following requests were manually identified as high-volume and low-risk,
+  # so drop them.
+  - level: None
+    users: ["system:kube-proxy"]
+    verbs: ["watch"]
+    resources:
+      - group: "" # core
+        resources: ["endpoints", "services", "services/status"]
+  - level: None
+    # Ingress controller reads 'configmaps/ingress-uid' through the unsecured port.
+    # TODO(#46983): Change this to the ingress controller service account.
+    users: ["system:unsecured"]
+    namespaces: ["kube-system"]
+    verbs: ["get"]
+    resources:
+      - group: "" # core
+        resources: ["configmaps"]
+  - level: None
+    users: ["kubelet"] # legacy kubelet identity
+    verbs: ["get"]
+    resources:
+      - group: "" # core
+        resources: ["nodes", "nodes/status"]
+  - level: None
+    userGroups: ["system:nodes"]
+    verbs: ["get"]
+    resources:
+      - group: "" # core
+        resources: ["nodes", "nodes/status"]
+  - level: None
+    users:
+      - system:kube-controller-manager
+      - system:kube-scheduler
+      - system:serviceaccount:kube-system:endpoint-controller
+    verbs: ["get", "update"]
+    namespaces: ["kube-system"]
+    resources:
+      - group: "" # core
+        resources: ["endpoints"]
+  - level: None
+    users: ["system:apiserver"]
+    verbs: ["get"]
+    resources:
+      - group: "" # core
+        resources: ["namespaces", "namespaces/status", "namespaces/finalize"]
+  - level: None
+    users: ["cluster-autoscaler"]
+    verbs: ["get", "update"]
+    namespaces: ["kube-system"]
+    resources:
+      - group: "" # core
+        resources: ["configmaps", "endpoints"]
+  # Don't log HPA fetching metrics.
+  - level: None
+    users:
+      - system:kube-controller-manager
+    verbs: ["get", "list"]
+    resources:
+      - group: "metrics.k8s.io"
+  # Don't log these read-only URLs.
+  - level: None
+    nonResourceURLs:
+      - /healthz*
+      - /version
+      - /swagger*
+  # Don't log events requests.
+  - level: None
+    resources:
+      - group: "" # core
+        resources: ["events"]
+  # node and pod status calls from nodes are high-volume and can be large, don't log responses for expected updates from nodes
+  - level: Request
+    users: ["kubelet", "system:node-problem-detector", "system:serviceaccount:kube-system:node-problem-detector"]
+    verbs: ["update","patch"]
+    resources:
+      - group: "" # core
+        resources: ["nodes/status", "pods/status"]
+    omitStages:
+      - "RequestReceived"
+  - level: Request
+    userGroups: ["system:nodes"]
+    verbs: ["update","patch"]
+    resources:
+      - group: "" # core
+        resources: ["nodes/status", "pods/status"]
+    omitStages:
+      - "RequestReceived"
+  # deletecollection calls can be large, don't log responses for expected namespace deletions
+  - level: Request
+    users: ["system:serviceaccount:kube-system:namespace-controller"]
+    verbs: ["deletecollection"]
+    omitStages:
+      - "RequestReceived"
+  # Secrets, ConfigMaps, and TokenReviews can contain sensitive & binary data,
+  # so only log at the Metadata level.
+  - level: Metadata
+    resources:
+      - group: "" # core
+        resources: ["secrets", "configmaps"]
+      - group: authentication.k8s.io
+        resources: ["tokenreviews"]
+    omitStages:
+      - "RequestReceived"
+  # Get repsonses can be large; skip them.
+  - level: Request
+    verbs: ["get", "list", "watch"]
+    resources:
+      - group: ""
+      - group: "admissionregistration.k8s.io"
+      - group: "apiextensions.k8s.io"
+      - group: "apiregistration.k8s.io"
+      - group: "apps"
+      - group: "authentication.k8s.io"
+      - group: "authorization.k8s.io"
+      - group: "autoscaling"
+      - group: "batch"
+      - group: "certificates.k8s.io"
+      - group: "extensions"
+      - group: "metrics.k8s.io"
+      - group: "networking.k8s.io"
+      - group: "node.k8s.io"
+      - group: "policy"
+      - group: "rbac.authorization.k8s.io"
+      - group: "scheduling.k8s.io"
+      - group: "settings.k8s.io"
+      - group: "storage.k8s.io"
+    omitStages:
+      - "RequestReceived"
+  # Default level for known APIs
+  - level: RequestResponse
+    resources: 
+      - group: "" 
+      - group: "admissionregistration.k8s.io"
+      - group: "apiextensions.k8s.io"
+      - group: "apiregistration.k8s.io"
+      - group: "apps"
+      - group: "authentication.k8s.io"
+      - group: "authorization.k8s.io"
+      - group: "autoscaling"
+      - group: "batch"
+      - group: "certificates.k8s.io"
+      - group: "extensions"
+      - group: "metrics.k8s.io"
+      - group: "networking.k8s.io"
+      - group: "node.k8s.io"
+      - group: "policy"
+      - group: "rbac.authorization.k8s.io"
+      - group: "scheduling.k8s.io"
+      - group: "settings.k8s.io"
+      - group: "storage.k8s.io"
+    omitStages:
+      - "RequestReceived"
+  # Default level for all other requests.
+  - level: Metadata
+    omitStages:
+      - "RequestReceived"
+EOF
+
+# 分发审计策略文件：
+for node_ip in ${MASTER_IPS[@]};  do
+    gecho ">>> 分发审计策略文件到 ${node_ip}"
+    scp ${WORK_DIR}/audit-policy.yaml root@${node_ip}:/opt/k8s/conf/audit-policy.yaml
+done
+}
+
+
+##################################################################
+# 创建后续访问 metrics-server 或 kube-prometheus 使用的证书
+####################################################################
+# 创建证书签名请求:
+kubeapi_proxy_cert(){
+cd ${WORK_DIR}
+cat > ${WORK_DIR}/proxy-client-csr.json <<EOF
+{
+  "CN": "aggregator",
+  "hosts": [],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "CN",
+      "ST": "BeiJing",
+      "L": "BeiJing",
+      "O": "k8s",
+      "OU": "${CSR_OU}"
+    }
+  ]
+}
+EOF
+
+# 生成证书和私钥：
+gecho ">>> 创建后续访问 metrics-server 或 kube-prometheus 使用的证书..."
+cfssl gencert -ca=/opt/k8s/cert/ca.pem \
+  -ca-key=${WORK_DIR}/ca-key.pem  \
+  -config=${WORK_DIR}/ca-config.json  \
+  -profile=kubernetes ${WORK_DIR}/proxy-client-csr.json | cfssljson -bare ${WORK_DIR}/proxy-client
+
+if [ $? -eq 0 ]; then
+  gecho ">>> 证书生成成功!"
+else
+  recho ">>> 证书生成失败！请检查原因"
+  exit 1
+fi
+
+# 将生成的 proxy 证书和私钥文件拷贝到所有 master 节点：
+for node_ip in ${MASTER_IPS[@]}; do
+    gecho ">>> 将生成的 proxy 证书和私钥文件拷贝到 master 节点 ${node_ip}"
+    scp ${WORK_DIR}/proxy-client*.pem root@${node_ip}:/opt/k8s/cert/
+done
+}
+
+#########################################################################################
+#创建和分发 kube-apiserver systemd unit 模板文件
+########################################################################################
+kubeapi_systemd(){
+cat > ${WORK_DIR}/kube-apiserver.service.template <<EOF
+[Unit]
+Description=Kubernetes API Server
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+After=network.target
+[Service]
+WorkingDirectory=${K8S_DIR}/kube-apiserver
+ExecStart=/opt/k8s/bin/kube-apiserver \\
+  --advertise-address=##NODE_IP## \\
+  --default-not-ready-toleration-seconds=360 \\
+  --default-unreachable-toleration-seconds=360 \\
+#  --feature-gates=DynamicAuditing=true \\
+  --max-mutating-requests-inflight=2000 \\
+  --max-requests-inflight=4000 \\
+  --default-watch-cache-size=200 \\
+  --delete-collection-workers=2 \\
+#  --encryption-provider-config=/opt/k8s/conf/encryption-config.yaml \\
+
+## ETCD使用的证书
+  --etcd-cafile=/opt/k8s/cert/ca.pem \\
+  --etcd-certfile=/opt/k8s/cert/kubernetes.pem \\
+  --etcd-keyfile=/opt/k8s/cert/kubernetes-key.pem \\
+  --etcd-servers=${ETCD_ENDPOINTS} \\
+
+  --bind-address=##NODE_IP## \\
+  --secure-port=6443 \\
+
+## api-server使用的证书
+  --tls-cert-file=/opt/k8s/cert/kubernetes.pem \\
+  --tls-private-key-file=/opt/k8s/cert/kubernetes-key.pem \\
+
+  --insecure-port=0 \\
+#  --audit-dynamic-configuration \\
+#  --audit-log-maxage=15 \\
+#  --audit-log-maxbackup=3 \\
+#  --audit-log-maxsize=100 \\
+#  --audit-log-truncate-enabled \\
+#  --audit-log-path=${K8S_DIR}/kube-apiserver/audit.log \\
+#  --audit-policy-file=/opt/k8s/conf/audit-policy.yaml \\
+  --profiling \\
+  --anonymous-auth=false \\
+
+## 用于验证请求的客户的证书的根证书
+  --client-ca-file=/opt/k8s/cert/ca.pem \\
+
+  --enable-bootstrap-token-auth \\
+  --requestheader-allowed-names="aggregator" \\
+  --requestheader-client-ca-file=/opt/k8s/cert/ca.pem \\
+  --requestheader-extra-headers-prefix="X-Remote-Extra-" \\
+  --requestheader-group-headers=X-Remote-Group \\
+  --requestheader-username-headers=X-Remote-User \\
+
+## used to verify ServiceAccount tokens. The specified file can contain multiple keys, 
+## and the flag can be specified multiple times with different files. If unspecified, --tls-private-key-file is used. 
+## Must be specified when --service-account-signing-key is provided
+## 公钥用于在认证期间验证pod中注入的service account中的Token，由--service-account-private-key-file在controller-manager中产生的token, 这个可以不是证书
+  --service-account-key-file=/opt/k8s/cert/ca.pem \\
+
+## Path to the file that contains the current private key of the service account token issuer. 
+## The issuer will sign issued ID tokens with this private key.
+  --service-account-signing-key-file=/opt/k8s/cert/ca-key.pem  \\
+  --service-account-issuer=https://kubernetes.default.svc.cluster.local \\
+
+  --authorization-mode=Node,RBAC \\
+  --runtime-config=api/all=true \\
+  --enable-admission-plugins=NodeRestriction \\
+  --allow-privileged=true \\
+  --apiserver-count=2 \\
+  --event-ttl=168h \\
+
+## 用于请求kubelet进使用的证书和验证kubelet证书的根证书
+  --kubelet-certificate-authority=/opt/k8s/cert/ca.pem \\
+  --kubelet-client-certificate=/opt/k8s/cert/kubernetes.pem \\
+  --kubelet-client-key=/opt/k8s/cert/kubernetes-key.pem \\
+
+#  --kubelet-https=true \\
+  --kubelet-timeout=10s \\
+
+## 表示当你使用kubectl exec 或 kubectl logs 时会使用这个选项
+## 此选项定义apiserver与kublet通信时使用的方式
+## Default: "Hostname,InternalDNS,InternalIP,ExternalDNS,ExternalIP"
+  --kubelet-preferred-address-types=InternalIP \\
+
+## kube-apiserver使用的聚合证书
+  --proxy-client-cert-file=/opt/k8s/cert/proxy-client.pem \\
+  --proxy-client-key-file=/opt/k8s/cert/proxy-client-key.pem \\
+
+  --service-cluster-ip-range=${SERVICE_CIDR} \\
+  --service-node-port-range=${NODE_PORT_RANGE} \\
+  --logtostderr=true \\
+  --v=2
+Restart=on-failure
+RestartSec=10
+Type=notify
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+
+#为各节点创建和分发 kube-apiserver systemd unit 文件
+#替换模板文件中的变量，为各节点生成 systemd unit 文件：
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ )); do
+    gecho ">>> 替换模板文件中的变量，为 ${MASTER_IPS[i]} 节点生成 systemd unit 文件..."
+    sed -e "s/##NODE_NAME##/${MASTER_NAMES[i]}/" -e "s/##NODE_IP##/${MASTER_IPS[i]}/" -e "/^[ ]*#.*$/d" -e "/^[ ]*$/d" \
+        ${WORK_DIR}/kube-apiserver.service.template > ${WORK_DIR}/kube-apiserver-${MASTER_IPS[i]}.service 
+done
+	
+# 分发|启动|检查生成的 systemd unit 文件：
+for node_ip in ${MASTER_IPS[@]}; do
+    gecho ">>> 分发生成的 systemd unit 文件 ${node_ip}"
+    scp ${WORK_DIR}/kube-apiserver-${node_ip}.service root@${node_ip}:/etc/systemd/system/kube-apiserver.service
+
+    gecho ">>> 启动 kube-apiserver 服务 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p ${K8S_DIR}/kube-apiserver"
+    if ssh root@${node_ip} "systemctl daemon-reload && systemctl enable kube-apiserver && systemctl restart kube-apiserver"; then
+        :
+    else
+        recho "启动kube-apiserver失败！请检查原因..."
+        exit -1
+    fi
+    sleep 5
+	
+    gecho ">>> 检查 kube-apiserver 运行状态 ${node_ip}"
+    ssh root@${node_ip} "systemctl status kube-apiserver |grep 'Active:'"
+done
+}
+
+
+###########################################
+# 创建 kube-controller-manager 证书和私钥
+###########################################
+# 创建证书签名请求：
+controller_cert(){
+cat > ${WORK_DIR}/kube-controller-manager-csr.json <<EOF
+{
+    "CN": "system:kube-controller-manager",
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "hosts": [
+      "127.0.0.1",
+    ],
+    "names": [
+      {
+        "C": "CN",
+        "ST": "BeiJing",
+        "L": "BeiJing",
+        "O": "system:kube-controller-manager",
+        "OU": "${CSR_OU}"
+      }
+    ]
+}
+EOF
+
+# 将IP添加到证书的hosts字段中
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ ))
+do
+  if [ "${i}" -eq 0 ]; then
+    sed -i '8a'"\      \"${MASTER_IPS[i]}\""'' ${WORK_DIR}/kube-controller-manager-csr.json
+  else
+    sed -i '8a'"\      \"${MASTER_IPS[i]}\","'' ${WORK_DIR}/kube-controller-manager-csr.json
+  fi
+done
+       
+# 生成证书和私钥：
+gecho ">>> 生成证书和私钥..."
+cfssl gencert -ca=${WORK_DIR}/ca.pem \
+  -ca-key=${WORK_DIR}/ca-key.pem \
+  -config=${WORK_DIR}/ca-config.json \
+  -profile=kubernetes ${WORK_DIR}/kube-controller-manager-csr.json | cfssljson -bare ${WORK_DIR}/kube-controller-manager
+
+if [ $? -eq 0 ]; then
+  gecho ">>> 证书生成成功!"
+else
+  recho ">>> 证书生成失败！请检查原因"
+  exit 1
+fi
+
+# 将生成的证书和私钥分发到所有 master 节点：
+for node_ip in ${MASTER_IPS[@]}; do
+    gecho ">>> 将生成的证书和私钥分发到 master 节点${node_ip}"
+    scp ${WORK_DIR}/kube-controller-manager*.pem root@${node_ip}:/opt/k8s/cert/
+done
+}
+
+#############################################
+# 创建和分发 kubeconfig 文件
+#############################################
+# kube-controller-manager 使用 kubeconfig 文件访问 apiserver，该文件提供了 apiserver 地址、嵌入的 CA 证书和 kube-controller-manager 证书等信息：
+function controller_kubeconfig(){
+gecho ">>> 创建kubeconfig文件..."
+kubectl config set-cluster kubernetes \
+  --certificate-authority=${WORK_DIR}/ca.pem \
+  --embed-certs=true \
+  --server=${KUBE_APISERVER} \
+  --kubeconfig=${WORK_DIR}/kube-controller-manager.kubeconfig
+kubectl config set-credentials system:kube-controller-manager \
+  --client-certificate=${WORK_DIR}/kube-controller-manager.pem \
+  --client-key=${WORK_DIR}/kube-controller-manager-key.pem \
+  --embed-certs=true \
+  --kubeconfig=${WORK_DIR}/kube-controller-manager.kubeconfig
+kubectl config set-context system:kube-controller-manager \
+  --cluster=kubernetes \
+  --user=system:kube-controller-manager \
+  --kubeconfig=${WORK_DIR}/kube-controller-manager.kubeconfig
+kubectl config use-context system:kube-controller-manager --kubeconfig=${WORK_DIR}/kube-controller-manager.kubeconfig
+
+# 分发 kubeconfig 到所有 master 节点：
+for node_ip in ${MASTER_IPS[@]}
+  do
+    gecho ">>> 分发 kubeconfig 到 master 节点: ${node_ip}"
+    scp ${WORK_DIR}/kube-controller-manager.kubeconfig root@${node_ip}:/opt/k8s/conf/kube-controller-manager.kubeconfig
+  done
+}
+
+#######################################################
+#创建 kube-controller-manager systemd unit 模板文件
+#######################################################
+controller_systemd(){
+cat > ${WORK_DIR}/kube-controller-manager.service.template <<EOF
+[Unit]
+Description=Kubernetes Controller Manager
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+[Service]
+WorkingDirectory=${K8S_DIR}/kube-controller-manager
+ExecStart=/opt/k8s/bin/kube-controller-manager \\
+  --profiling \\
+  --cluster-name=kubernetes \\
+  --controllers=*,bootstrapsigner,tokencleaner \\
+  --kube-api-qps=1000 \\
+  --kube-api-burst=2000 \\
+  --leader-elect \\
+  --use-service-account-credentials\\
+  --concurrent-service-syncs=2 \\
+  --bind-address=##NODE_IP## \\
+  --secure-port=10257 \\
+
+## 用于监听请求端口的服务器证书
+#   --tls-cert-file=/opt/k8s/cert/kube-controller-manager.pem \\
+#   --tls-private-key-file=/opt/k8s/cert/kube-controller-manager-key.pem \\
+## 用于验证请求客户端的证书
+#  --client-ca-file=/opt/k8s/cert/ca.pem \\
+
+  --authentication-kubeconfig=/opt/k8s/conf/kube-controller-manager.kubeconfig \\
+  --authorization-kubeconfig=/opt/k8s/conf/kube-controller-manager.kubeconfig \\
+  --requestheader-allowed-names="aggregator" \\
+  --requestheader-client-ca-file=/opt/k8s/cert/ca.pem \\
+  --requestheader-extra-headers-prefix="X-Remote-Extra-" \\
+  --requestheader-group-headers=X-Remote-Group \\
+  --requestheader-username-headers=X-Remote-User \\
+
+## 用于给csr请求的证书签名用的根证书和私钥
+  --cluster-signing-cert-file=/opt/k8s/cert/ca.pem \\
+  --cluster-signing-key-file=/opt/k8s/cert/ca-key.pem \\
+## 用于设定csr请求时颁发证书的有效期时间
+  --experimental-cluster-signing-duration=876000h \\
+
+  --horizontal-pod-autoscaler-sync-period=10s \\
+  --concurrent-deployment-syncs=10 \\
+  --concurrent-gc-syncs=30 \\
+  --node-cidr-mask-size=24 \\
+#  --service-cluster-ip-range=${SERVICE_CIDR} \\
+  --pod-eviction-timeout=6m \\
+  --terminated-pod-gc-threshold=10000 \\
+
+## 此根证书默认会注入到service account的token中做为pod访问api-server时验证api-server证书的根CA
+  --root-ca-file=/opt/k8s/cert/ca.pem \\
+
+## 这个key用于给pod中注入的sevice account签名，对应的--service-account-key-file 参数选项将相应的（public key）公匙传递给kube-apiserver ，公钥用于在认证期间验证Token。
+  --service-account-private-key-file=/opt/k8s/cert/ca-key.pem \\
+
+  --kubeconfig=/opt/k8s/conf/kube-controller-manager.kubeconfig \\
+  --logtostderr=true \\
+  --v=2
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 为各节点创建和分发 kube-controller-mananger systemd unit 文件
+# 替换模板文件中的变量，为各节点创建 systemd unit 文件：
+for (( i=0; i < ${#MASTER_IPS[@]}; i++ ))
+  do
+    gecho ">>> 替换模板文件中的变量，为节点 ${MASTER_IPS[i]} 创建 systemd unit 文件"
+    sed -e "s/##NODE_NAME##/${MASTER_NAMES[i]}/" -e "s/##NODE_IP##/${MASTER_IPS[i]}/" -e "/^[ ]*#.*$/d" -e "/^[ ]*$/d" ${WORK_DIR}/kube-controller-manager.service.template > ${WORK_DIR}/kube-controller-manager-${MASTER_IPS[i]}.service 
+  done
+
+# 分发|启动|检查 kube-controller-manager 服务：
+for node_ip in ${MASTER_IPS[@]}
+  do
+    gecho ">>> 分发到 master 节点 ${node_ip}"
+    scp ${WORK_DIR}/kube-controller-manager-${node_ip}.service root@${node_ip}:/etc/systemd/system/kube-controller-manager.service
+
+    gecho ">>> 启动 kube-controller-manager 服务 ${node_ip} ..."
+    ssh root@${node_ip} "mkdir -p ${K8S_DIR}/kube-controller-manager"
+    ssh root@${node_ip} "systemctl daemon-reload && systemctl enable kube-controller-manager && systemctl restart kube-controller-manager"
+	sleep 5
+	
+    gecho ">>> 检查服务运行状态 ${node_ip}"
+    ssh root@${node_ip} "systemctl status kube-controller-manager|grep Active"
+  done
+}
+
+
+#########################################################################
+#                创建 kube-scheduler 证书和私钥
+#########################################################################
+# 创建证书签名请求：
+scheduler_cert(){
+cat > ${WORK_DIR}/kube-scheduler-csr.json <<EOF
+{
+    "CN": "system:kube-scheduler",
+    "hosts": [
+      "127.0.0.1",
+    ],
+    "key": {
+        "algo": "rsa",
+        "size": 2048
+    },
+    "names": [
+      {
+        "C": "CN",
+        "ST": "BeiJing",
+        "L": "BeiJing",
+        "O": "system:kube-scheduler",
+        "OU": "zhuanche"
+      }
+    ]
+}
+EOF
+
+# 将IP添加到证书的hosts字段中
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ ))
+do
+  if [ "${i}" -eq 0 ]; then
+    sed -i '4a'"\      \"${MASTER_IPS[i]}\""'' ${WORK_DIR}/kube-scheduler-csr.json
+  else
+    sed -i '4a'"\      \"${MASTER_IPS[i]}\","'' ${WORK_DIR}/kube-scheduler-csr.json
+  fi
+done   
+
+# 生成证书和私钥：
+gecho ">>> 生成证书和私钥..."
+cfssl gencert -ca=${WORK_DIR}/ca.pem \
+  -ca-key=${WORK_DIR}/ca-key.pem \
+  -config=${WORK_DIR}/ca-config.json \
+  -profile=kubernetes ${WORK_DIR}/kube-scheduler-csr.json | cfssljson -bare ${WORK_DIR}/kube-scheduler
+
+if [ $? -eq 0 ]; then
+  gecho ">>> 证书生成成功!"
+else
+  recho ">>> 证书生成失败！请检查原因"
+  exit 1
+fi
+
+# 将生成的证书和私钥分发到所有 master 节点：
+for node_ip in ${MASTER_IPS[@]}
+  do
+    echo ">>> ${node_ip}"
+    scp ${WORK_DIR}/kube-scheduler*.pem root@${node_ip}:/opt/k8s/cert/
+  done
+}
+
+############################################################
+#              创建和分发 kubeconfig 文件
+############################################################
+# kube-scheduler 使用 kubeconfig 文件访问 apiserver，该文件提供了 apiserver 地址、嵌入的 CA 证书和 kube-scheduler 证书：
+scheduler_kubeconfig(){
+gecho ">>> 创建kubeconfig文件..."
+kubectl config set-cluster kubernetes \
+  --certificate-authority=${WORK_DIR}/ca.pem \
+  --embed-certs=true \
+  --server=${KUBE_APISERVER} \
+  --kubeconfig=${WORK_DIR}/kube-scheduler.kubeconfig
+kubectl config set-credentials system:kube-scheduler \
+  --client-certificate=${WORK_DIR}/kube-scheduler.pem \
+  --client-key=${WORK_DIR}/kube-scheduler-key.pem \
+  --embed-certs=true \
+  --kubeconfig=${WORK_DIR}/kube-scheduler.kubeconfig
+kubectl config set-context system:kube-scheduler \
+  --cluster=kubernetes \
+  --user=system:kube-scheduler \
+  --kubeconfig=${WORK_DIR}/kube-scheduler.kubeconfig
+kubectl config use-context system:kube-scheduler --kubeconfig=${WORK_DIR}/kube-scheduler.kubeconfig
+
+# 分发 kubeconfig 到所有 master 节点：
+for node_ip in ${MASTER_IPS[@]}; do
+    gecho ">>> 分发 kubeconfig 到 master 节点: ${node_ip}"
+    scp ${WORK_DIR}/kube-scheduler.kubeconfig root@${node_ip}:/opt/k8s/conf/kube-scheduler.kubeconfig
+  done
+}
+
+##############################################################
+#          创建 kube-scheduler 配置文件
+##############################################################
+scheduler_config(){
+gecho "创建 kube-scheduler 配置文件..."
+cat >${WORK_DIR}/kube-scheduler.yaml.template <<EOF
+#apiVersion: kubescheduler.config.k8s.io/v1alpha2
+apiVersion: kubescheduler.config.k8s.io/v1beta1
+kind: KubeSchedulerConfiguration
+#bindTimeoutSeconds: 600
+clientConnection:
+  burst: 200
+  kubeconfig: "/opt/k8s/conf/kube-scheduler.kubeconfig"
+  qps: 100
+enableContentionProfiling: false
+enableProfiling: true
+leaderElection:
+  leaderElect: true
+EOF
+
+# 替换模板文件中的变量：
+for (( i=0; i < ${#MASTER_IPS[@]}; i++ ));  do
+    gecho ">>> 修改kube-scheduler 配置模板文件中的变量 for ${MASTER_IPS[i]} "
+    sed -e "s/##NODE_NAME##/${MASTER_NAMES[i]}/" -e "s/##NODE_IP##/${MASTER_IPS[i]}/" -e "/^[ ]*#.*$/d" \
+       ${WORK_DIR}/kube-scheduler.yaml.template > ${WORK_DIR}/kube-scheduler-${MASTER_IPS[i]}.yaml
+  done
+
+# 分发 kube-scheduler 配置文件到所有 master 节点：
+for node_ip in ${MASTER_IPS[@]}
+  do
+    gecho ">>> 分发 kube-scheduler 配置文件到 master 节点 ${node_ip}"
+    scp ${WORK_DIR}/kube-scheduler-${node_ip}.yaml root@${node_ip}:/opt/k8s/conf/kube-scheduler.yaml
+  done
+}
+
+###################################################################
+#             创建 kube-scheduler systemd unit 模板文件
+###################################################################
+scheduler_systemd(){
+cat > ${WORK_DIR}/kube-scheduler.service.template <<EOF
+[Unit]
+Description=Kubernetes Scheduler
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+[Service]
+WorkingDirectory=${K8S_DIR}/kube-scheduler
+ExecStart=/opt/k8s/bin/kube-scheduler \\
+#  --config=/opt/k8s/conf/kube-scheduler.yaml \\
+  --bind-address=##NODE_IP## \\
+  --secure-port=10259 \\
+#  --port=0 \\
+  --tls-cert-file=/opt/k8s/cert/kube-scheduler.pem \\
+  --tls-private-key-file=/opt/k8s/cert/kube-scheduler-key.pem \\
+  --authentication-kubeconfig=/opt/k8s/conf/kube-scheduler.kubeconfig \\
+  --authorization-kubeconfig=/opt/k8s/conf/kube-scheduler.kubeconfig \\
+  --kubeconfig=/opt/k8s/conf/kube-scheduler.kubeconfig \\
+  --client-ca-file=/opt/k8s/cert/ca.pem \\
+  --requestheader-allowed-names= \\
+  --requestheader-client-ca-file=/opt/k8s/cert/ca.pem \\
+  --requestheader-extra-headers-prefix="X-Remote-Extra-" \\
+  --requestheader-group-headers=X-Remote-Group \\
+  --requestheader-username-headers=X-Remote-User \\
+  --logtostderr=true \\
+  --v=2
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 为各节点创建和分发 kube-scheduler systemd unit 文件
+# 替换模板文件中的变量，为各节点创建 systemd unit 文件：
+for (( i=0; i < ${#MASTER_IPS[@]}; i++ )); do
+    gecho ">>> 替换 systemd unit 模板文件中的变量 for ${MASTER_IPS[i]}"
+    sed -e "s/##NODE_NAME##/${MASTER_NAMES[i]}/" -e "s/##NODE_IP##/${MASTER_IPS[i]}/" -e "/^[ ]*#.*$/d" \
+        ${WORK_DIR}/kube-scheduler.service.template > ${WORK_DIR}/kube-scheduler-${MASTER_IPS[i]}.service 
+  done
+
+# 分发|启动|检查 systemd unit 在所有 master 节点：
+for node_ip in ${MASTER_IPS[@]}; do
+    gecho ">>> 分发 systemd unit 文件到 master 节点 ${node_ip}"
+    scp ${WORK_DIR}/kube-scheduler-${node_ip}.service root@${node_ip}:/etc/systemd/system/kube-scheduler.service
+
+    gecho ">>> 启动 kube-scheduler 服务 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p ${K8S_DIR}/kube-scheduler"
+    ssh root@${node_ip} "systemctl daemon-reload && systemctl enable kube-scheduler && systemctl restart kube-scheduler"
+	sleep 5
+	
+    gecho ">>> 检查服务运行状态 ${node_ip}"
+    ssh root@${node_ip} "systemctl status kube-scheduler|grep Active"
+  done
+}
+
+
+#############################################################
+# containerd下载并分发二进制文件
+#############################################################
+containerd_get(){
+gecho ">>> 下载work节点需要的containerd二进制文件并分发..."
+if [ ! -f "${WORK_DIR}/${CRICTL}" ]; then
+  wget ${GET_CRICTL} -O ${WORK_DIR}/${CRICTL}
+fi
+
+if [ $? -eq 0 ]; then
+  tar -xvf ${WORK_DIR}/${CRICTL} -C ${WORK_DIR}
+else
+  recho "下载 ${CRICTL} 失败，请检查链接或网络!"
+  exit 1
+fi
+
+if [ ! -f  ${WORK_DIR}/${RUNC} ]; then
+  wget ${GET_RUNC} -O ${WORK_DIR}/${RUNC}
+fi
+if [ $? -eq 0 ]; then
+  rm -f ${WORK_DIR}/runc >/dev/null 2>&1
+  sudo mv ${WORK_DIR}/${RUNC} ${WORK_DIR}/runc
+else
+  recho "下载 ${RUNC} 失败，请检查链接或网络!"
+  exit 
+fi
+
+if [ ! -f ${WORK_DIR}/${CNI_PLUGINS} ]; then
+  wget ${GET_CNI_PLUGINS} -O ${WORK_DIR}/${CNI_PLUGINS}
+fi
+if [ $? -eq 0 ]; then
+  mkdir ${WORK_DIR}/cni-plugins
+  sudo tar -xvf ${WORK_DIR}/${CNI_PLUGINS} -C ${WORK_DIR}/cni-plugins
+else
+  recho "下载 ${CNI_PLUGINS} 失败，请检查链接或网络!"
+  exit 
+fi
+
+if [ ! -f ${WORK_DIR}/${CONTAINERD} ]; then
+  wget ${GET_CONTAINERD} -O ${WORK_DIR}/${CONTAINERD}
+fi
+if [ $? -eq 0 ]; then
+  mkdir ${WORK_DIR}/containerd
+  tar -xvf ${WORK_DIR}/${CONTAINERD} -C ${WORK_DIR}/containerd
+else
+  recho "下载 ${CONTAINERD} 失败，请检查链接或网络!"
+  exit 
+fi
+
+# 分发二进制文件到所有 worker 节点：
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+    gecho ">>> 分发二进制文件到 worker 节点 ${node_ip}"
+    ssh root@${node_ip} "mkdir /opt/cni/bin -p && mkdir /opt/containerd/{bin,lib} -p"
+    scp ${WORK_DIR}/containerd/bin/* ${WORK_DIR}/crictl ${WORK_DIR}/runc root@${node_ip}:/opt/containerd/bin
+    scp ${WORK_DIR}/cni-plugins/* root@${node_ip}:/opt/cni/bin
+    ssh root@${node_ip} "chmod a+x /opt/containerd/bin/* && mkdir -p /etc/cni/net.d"
+  done
+}
+
+############################################
+#     创建和分发 containerd 配置文件
+############################################
+# state = "${CONTAINERD_DIR}/state" 不建议使用自定义的state目录，建议使用/run/containerd目录，
+# 否则会导致container下次启动时会导致每100秒进行一次 clean dead shim...，将所有的 dead shim clean 完成后才会启动, 原因未知。
+# 如果 systemd 使用 Type=notify 方式也会同样的启动缓慢，导致 kubelet 检测不到 containerd 而无法启动，造成集群不正常。
+containerd_config(){
+cat > ${WORK_DIR}/containerd-config.toml << EOF
+root = "${CONTAINERD_DIR}/root"
+state = "/run/containerd"
+version = 2
+[plugins]
+  [plugins."io.containerd.runtime.v1.linux"]
+    no_shim = false
+    runtime = "runc"
+    runtime_root = ""
+    shim = "containerd-shim"
+    shim_debug = false
+
+  [plugins."io.containerd.grpc.v1.cri"]
+    sandbox_image = "registry.cn-beijing.aliyuncs.com/leooo/pause:3.6"
+    [plugins."io.containerd.grpc.v1.cri".cni]
+      bin_dir = "/opt/cni/bin"
+      conf_dir = "/etc/cni/net.d"
+      conf_template = ""
+      max_conf_num = 1
+
+    [plugins."io.containerd.grpc.v1.cri".containerd]
+      default_runtime_name = "runc"
+      disable_snapshot_annotations = true
+      discard_unpacked_layers = false
+      no_pivot = false
+      snapshotter = "overlayfs"
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+          base_runtime_spec = ""
+          container_annotations = []
+          pod_annotations = []
+          privileged_without_host_devices = false
+          runtime_engine = ""
+          runtime_root = ""
+          runtime_type = "io.containerd.runc.v2"
+
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            BinaryName = ""
+            CriuImagePath = ""
+            CriuPath = ""
+            CriuWorkPath = ""
+            IoGid = 0
+            IoUid = 0
+            NoNewKeyring = false
+            NoPivotRoot = false
+            Root = ""
+            ShimCgroup = ""
+            ## Cgroup Driver 使用 systemd
+            SystemdCgroup = true
+
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+            endpoint = ["https://fogjl973.mirror.aliyuncs.com", "https://registry-1.docker.io"]
+EOF
+
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+    gecho ">>> 分发 containerd 配置文件 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p /etc/containerd ${CONTAINERD_DIR}/{root,state}"
+    scp ${WORK_DIR}/containerd-config.toml root@${node_ip}:/etc/containerd/config.toml
+  done
+}
+
+##############################################
+# 创建和分发 containerd systemd unit 文件
+##############################################
+containerd_systemd(){
+cat > ${WORK_DIR}/containerd.service <<EOF
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+Type=notify
+Environment="PATH=/opt/containerd/bin:/bin:/sbin:/usr/bin:/usr/sbin"
+ExecStartPre=/sbin/modprobe overlay
+ExecStart=/opt/containerd/bin/containerd
+Restart=always
+RestartSec=5
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-999
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 分发 systemd unit 文件，启动 containerd 服务
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+  gecho ">>> 分发 systemd unit 文件，启动 containerd 服务 ${node_ip}"
+  scp ${WORK_DIR}/containerd.service root@${node_ip}:/etc/systemd/system
+done
+
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+  gecho ">>> 启动 containerd 服务 ${node_ip}"
+  ssh root@${node_ip} "systemctl enable containerd && systemctl restart containerd"
+  sleep 5
+done
+	
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+  gecho ">>> 检查服务运行状态 ${node_ip}"
+  ssh root@${node_ip} "systemctl status containerd | grep Active"
+done
+}
+
+######################################
+# 创建和分发 crictl 配置文件
+######################################
+# crictl 是兼容 CRI 容器运行时的命令行工具，提供类似于 docker 命令的功能。具体参考官方文档。
+containerd_crctl(){
+cat > ${WORK_DIR}/crictl.yaml << EOF
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+debug: false
+EOF
+
+# 分发 crictl 到所有 worker 节点：
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+    gecho ">>> 分发 crictl.yaml 文件到${node_ip}"
+    scp ${WORK_DIR}/crictl.yaml root@${node_ip}:/etc/crictl.yaml
+  done
+}
+
+
+########################################################
+# 下载和分发 docker 二进制文件
+########################################################
+docker_get() {
+echo "test.........."
+gecho ">>> 下载并解压 docker 文件"
+if [ ! -f ${WORK_DIR}/${DOCKER} ]; then
+  if wget ${GET_DOCKER} -O ${WORK_DIR}/${DOCKER}; then
+    gecho "成功！"
+    tar -xf ${WORK_DIR}/${DOCKER} -C ${WORK_DIR}
+  else
+    recho "下载 ${DOCKER} 失败，请检查链接或网络!"
+    exit 1
+  fi
+else 
+  if tar -xf ${WORK_DIR}/${DOCKER} -C ${WORK_DIR}; then
+		gecho "成功！"
+	else
+		recho "失败！"
+		exit 1
+  fi
+fi
+
+if [ ! -f ${WORK_DIR}/${CNI_PLUGINS} ]; then
+  wget ${GET_CNI_PLUGINS} -O ${WORK_DIR}/${CNI_PLUGINS}
+fi
+if [ $? -eq 0 ]; then
+  mkdir ${WORK_DIR}/cni-plugins
+  sudo tar -xvf ${WORK_DIR}/${CNI_PLUGINS} -C ${WORK_DIR}/cni-plugins
+else
+  recho "下载 ${CNI_PLUGINS} 失败，请检查链接或网络!"
+  exit 
+fi
+
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]} 
+  do
+    ssh root@${node_ip} "mkdir /opt/{dockerd,cni}/bin /etc/cni/net.d -p "
+    gecho ">>> 分发 docker 二进制文件到 ${node_ip}"
+    scp ${WORK_DIR}/docker/* root@${node_ip}:/opt/dockerd/bin/
+    scp ${WORK_DIR}/cni-plugins/* root@${node_ip}:/opt/cni/bin
+    ssh root@${node_ip} "chmod +x /opt/dockerd/bin/*"
+  done
+}
+
+##########################################
+#创建和分发 systemd unit 文件 for Docker
+#########################################
+docker_systemd(){
+cat > ${WORK_DIR}/docker.service <<"EOF"
+[Unit]
+Description=Docker Application Container Engine
+Documentation=http://docs.docker.io
+After=network-online.target firewalld.service containerd.service
+Wants=network-online.target
+Requires=docker.socket containerd.service
+
+[Service]
+Type=notify
+WorkingDirectory=##DOCKER_DIR##
+Environment="PATH=/opt/dockerd/bin:/bin:/sbin:/usr/bin:/usr/sbin"
+ExecStart=/opt/dockerd/bin/dockerd --containerd=/run/containerd/containerd.sock
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutSec=0
+RestartSec=2
+Restart=always
+StartLimitBurst=3
+StartLimitInterval=60s
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+TasksMax=infinity
+Delegate=yes
+KillMode=process
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > ${WORK_DIR}/docker.socket <<"EOF"
+[Unit]
+Description=Docker Socket for the API
+
+[Socket]
+Environment="PATH=/opt/dockerd/bin:/bin:/sbin:/usr/bin:/usr/sbin"
+ListenStream=/var/run/docker.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=docker
+
+[Install]
+WantedBy=sockets.target
+EOF
+
+cat > ${WORK_DIR}/containerd.service <<"EOF"
+[Unit]
+Description=containerd container runtime
+Documentation=https://containerd.io
+After=network.target local-fs.target
+
+[Service]
+# Type=notify 充许此选项在centos7，docker18.09.x中无法启动containerd， docker 20.10.x可以使用些选项
+Environment="PATH=/opt/dockerd/bin:/bin:/sbin:/usr/bin:/usr/sbin"
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart=/opt/dockerd/bin/containerd
+Delegate=yes
+KillMode=process
+Restart=always
+RestartSec=5
+LimitNPROC=infinity
+LimitCORE=infinity
+LimitNOFILE=1048576
+TasksMax=infinity
+OOMScoreAdjust=-999
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 配置和分发 docker 配置文件
+# 使用国内的仓库镜像服务器以加快 pull image 的速度，同时增加下载的并发数 (需要重启 dockerd 生效)，
+# 定义Cgroup Driver为systemd或cgroupfs， 可以使用："exec-opts": ["native.cgroupdriver=systemd"],
+
+# 注意:!!!!!!!!!!!!!
+# 使用docker版本为18.09.x 并二进制安装时，cgroup driver 不支持使用systemd，只能使用cgroupfs，同时要将kubelet也要改为cgroupfs。
+# 使用docker版本为20.10.x 并二进制安装时，cgroup driver 支持使用systemd，同时要将kubelet也要改为systemd。
+cat > ${WORK_DIR}/docker-daemon.json <<EOF
+{
+    "exec-opts": ["native.cgroupdriver=systemd"],
+    "max-concurrent-downloads": 20,
+    "live-restore": true,
+    "max-concurrent-uploads": 10,
+    "debug": false,
+    "data-root": "${DOCKER_DIR}/data",
+    "exec-root": "${DOCKER_DIR}/exec",
+    "log-driver": "json-file",
+    "log-opts": {
+      "max-size": "100m",
+      "max-file": "5"
+    },
+    "storage-driver": "overlay2",
+    "registry-mirrors": ["https://c58pss01.mirror.aliyuncs.com"]
+}
+EOF
+
+# 分发|启动|检查 docker 配置文件到所有 worker 节点：
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}
+  do
+    sed -i -e "s|##DOCKER_DIR##|${DOCKER_DIR}|" ${WORK_DIR}/docker.service
+    gecho ">>> 分发 docker/containerd systemd 文件到 ${node_ip}"
+    scp ${WORK_DIR}/docker.service ${WORK_DIR}/docker.socket ${WORK_DIR}/containerd.service root@${node_ip}:/etc/systemd/system/
+  done
+
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}
+  do
+    gecho ">>> 分发 docker 配置文件到 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p  /etc/docker/ ${DOCKER_DIR}/{data,exec}"
+    ssh root@${node_ip} "groupadd docker"
+    scp ${WORK_DIR}/docker-daemon.json root@${node_ip}:/etc/docker/daemon.json
+  done
+
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}
+  do
+    gecho ">>> 启动 docker 服务 ${node_ip}"
+    ssh root@${node_ip} "systemctl daemon-reload && systemctl enable containerd && systemctl restart containerd"
+    ssh root@${node_ip} "systemctl daemon-reload && systemctl enable docker && systemctl restart docker"
+    sleep 5
+  done
+
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}
+  do
+    gecho ">>> 检查服务运行状态 ${node_ip}"
+    ssh root@${node_ip} "echo "containerd"; systemctl status containerd |grep Active"
+    ssh root@${node_ip} "echo "docker"; systemctl status docker|grep Active"
+  done
+}
+
+
+##############################################################
+#         下载和分发 kubelet 二进制文件
+##############################################################
+kubelet_get(){
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+    gecho ">>> 分发 kubelet 二进制文件 ${node_ip}"
+    scp ${WORK_DIR}/kubernetes/server/bin/{kube-proxy,kubelet,mounter} root@${node_ip}:/opt/k8s/bin/
+    ssh root@${node_ip} "chmod +x /opt/k8s/bin/*"
+done
+
+if [ ! $? -eq 0 ]; then
+  recho "分发文件失败，请检查文件是否存在!"
+  exit 
+fi
+}
+
+###############################################################
+# 创建 kubelet bootstrap kubeconfig 文件
+###############################################################
+# 创建bootstrap token的secret文件
+kubelet_kubeconfig(){
+cat > ${WORK_DIR}/bootstrap_token.yaml.template << EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  # Name MUST be of form "bootstrap-token-<token id>"
+  name: bootstrap-token-##TOKEN_ID##
+  namespace: kube-system
+
+# Type MUST be 'bootstrap.kubernetes.io/token'
+type: bootstrap.kubernetes.io/token
+stringData:
+  # Human readable description. Optional.
+  description: "The default bootstrap token generated by 'kubeadm init'."
+
+  # Token ID and secret. Required.
+  token-id: "##TOKEN_ID##"
+  token-secret: "##TOKEN_SECRET##"
+
+  # Expiration. Optional.
+  # expiration: 2017-03-10T03:22:11Z
+
+  # Allowed usages.
+  usage-bootstrap-authentication: "true"
+  usage-bootstrap-signing: "true"
+
+  # Extra groups to authenticate the token as. Must start with "system:bootstrappers:"
+  auth-extra-groups: system:bootstrappers:worker,system:bootstrappers:ingress
+EOF
+
+for node_name in ${NODE_NAMES[@]} ${MASTER_NAMES[@]}; do
+    # 创建 token
+    gecho ">>> 创建 kubelet bootstrap token 文件 for ${node_name}"
+    TOKEN_ID=$(head -c 6 /dev/urandom | md5sum | head -c 6)
+    TOKEN_SECRET=$(head -c 16 /dev/urandom | md5sum | head -c 16)
+    # while true; do 
+    #     TOKEN_ID=$(head -c 6 /dev/urandom | md5sum | head -c 6)
+    #     TOKEN_SECRET=$(head -c 16 /dev/urandom | md5sum | head -c 16)
+    #     TMP_TOKEN_ID=$(echo "$TOKEN_ID" | tr -dc a-z)
+    #     if [ -n "$TMP_TOKEN_ID" ]; then 
+    #         break
+    #     fi
+    # done
+    BOOTSTRAP_TOKEN=${TOKEN_ID}.${TOKEN_SECRET}
+    sed -e "s/##TOKEN_ID##/${TOKEN_ID}/" -e "s/##TOKEN_SECRET##/${TOKEN_SECRET}/" ${WORK_DIR}/bootstrap_token.yaml.template > ${WORK_DIR}/bootstrap_token_${TOKEN_ID}.yaml
+    kubectl apply -f ${WORK_DIR}/bootstrap_token_${TOKEN_ID}.yaml
+
+    gecho ">>> 创建 kubelet bootstrap kubeconfig 文件 ${node_name}"
+    # 设置集群参数
+    kubectl config set-cluster kubernetes \
+      --certificate-authority=${WORK_DIR}/ca.pem \
+      --embed-certs=true \
+      --server=${KUBE_APISERVER} \
+      --kubeconfig=${WORK_DIR}/kubelet-bootstrap-${node_name}.kubeconfig
+    # 设置客户端认证参数
+    kubectl config set-credentials kubelet-bootstrap \
+      --token=${BOOTSTRAP_TOKEN} \
+      --kubeconfig=${WORK_DIR}/kubelet-bootstrap-${node_name}.kubeconfig
+    # 设置上下文参数
+    kubectl config set-context default \
+      --cluster=kubernetes \
+      --user=kubelet-bootstrap \
+      --kubeconfig=${WORK_DIR}/kubelet-bootstrap-${node_name}.kubeconfig
+# 设置默认上下文
+    kubectl config use-context default --kubeconfig=${WORK_DIR}/kubelet-bootstrap-${node_name}.kubeconfig
+  done
+	
+# 分发 bootstrap kubeconfig 文件到所有 worker 节点
+for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+    gecho ">>> 分发 bootstrap kubeconfig 文件到 worker 节点 ${NODE_NAMES[i]}"
+    scp ${WORK_DIR}/kubelet-bootstrap-${NODE_NAMES[i]}.kubeconfig root@${NODE_IPS[i]}:/opt/k8s/conf/kubelet-bootstrap.kubeconfig
+  done
+
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ )); do
+    gecho ">>> 分发 bootstrap kubeconfig 文件到 worker 节点 ${MASTER_NAMES[i]}"
+    scp ${WORK_DIR}/kubelet-bootstrap-${MASTER_NAMES[i]}.kubeconfig root@${MASTER_IPS[i]}:/opt/k8s/conf/kubelet-bootstrap.kubeconfig
+  done
+}
+
+#################################################################################################
+#                             创建和分发 kubelet 参数配置文件
+################################################################################################
+# 从 v1.10 开始，部分 kubelet 参数需在配置文件中配置，kubelet --help 会提示：
+# DEPRECATED: This parameter should be set via the config file specified by the Kubelet's --config flag
+# 创建 kubelet 参数配置文件模板（可配置项参考代码中注释）：
+kubelet_config(){
+cat > ${WORK_DIR}/kubelet-config.yaml.template <<EOF
+kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+address: "##NODE_IP##"
+staticPodPath: ""
+syncFrequency: 1m
+fileCheckFrequency: 20s
+httpCheckFrequency: 20s
+staticPodURL: ""
+port: 10250
+readOnlyPort: 0
+rotateCertificates: true
+serverTLSBootstrap: true
+authentication:
+  anonymous:
+    enabled: false
+  webhook:
+    enabled: true
+  x509:
+    clientCAFile: "/opt/k8s/cert/ca.pem"
+authorization:
+  mode: Webhook
+registryPullQPS: 0
+registryBurst: 20
+eventRecordQPS: 0
+eventBurst: 20
+enableDebuggingHandlers: true
+enableContentionProfiling: true
+healthzPort: 10248
+healthzBindAddress: "##NODE_IP##"
+clusterDomain: "${CLUSTER_DNS_DOMAIN}"
+clusterDNS:
+  - "${CLUSTER_DNS_SVC_IP}"
+nodeStatusUpdateFrequency: 10s
+nodeStatusReportFrequency: 1m
+imageMinimumGCAge: 2m
+imageGCHighThresholdPercent: 85
+imageGCLowThresholdPercent: 80
+volumeStatsAggPeriod: 1m
+kubeletCgroups: ""
+systemCgroups: ""
+cgroupRoot: ""
+cgroupsPerQOS: true
+## 此选项必须和 run time 的 cgropDriver 相同，docker 18.09.x二进制安装只支持 cgroupDriver: cgroupfs
+cgroupDriver: systemd
+runtimeRequestTimeout: 10m
+hairpinMode: promiscuous-bridge
+maxPods: 220
+# podCIDR: "${CLUSTER_CIDR}"
+podPidsLimit: -1
+resolvConf: /etc/resolv.conf
+maxOpenFiles: 1000000
+kubeAPIQPS: 1000
+kubeAPIBurst: 2000
+serializeImagePulls: false
+evictionHard:
+  memory.available:  "100Mi"
+  nodefs.available:  "10%"
+  nodefs.inodesFree: "5%"
+  imagefs.available: "15%"
+evictionSoft: {}
+enableControllerAttachDetach: true
+failSwapOn: true
+containerLogMaxSize: 20Mi
+containerLogMaxFiles: 10
+systemReserved: {}
+kubeReserved: {}
+systemReservedCgroup: ""
+kubeReservedCgroup: ""
+enforceNodeAllocatable: ["pods"]
+## Default volumePluginDir: "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/"
+# volumePluginDir: "${K8S_DIR}/kubelet/kubelet-plugins/volume/exec/"
+EOF
+
+# 为各节点创建和分发 kubelet 配置文件：
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do 
+    gecho ">>> 为各节点创建和分发 kubelet 配置文件 ${node_ip}"
+    sed -e "s/##NODE_IP##/${node_ip}/" ${WORK_DIR}/kubelet-config.yaml.template > ${WORK_DIR}/kubelet-config-${node_ip}.yaml.template
+    scp ${WORK_DIR}/kubelet-config-${node_ip}.yaml.template root@${node_ip}:/opt/k8s/conf/kubelet-config.yaml
+  done
+}
+
+####################################################################
+#       创建和分发 kubelet systemd unit 文件 for containerd        #
+####################################################################
+# 创建 kubelet systemd unit 文件模板：
+kubelet_systemd_for_containerd(){
+cat > ${WORK_DIR}/kubelet.service.template <<EOF
+[Unit]
+Description=Kubernetes Kubelet
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+After=containerd.service
+Requires=containerd.service
+[Service]
+WorkingDirectory=${K8S_DIR}/kubelet
+ExecStart=/opt/k8s/bin/kubelet \\
+  --bootstrap-kubeconfig=/opt/k8s/conf/kubelet-bootstrap.kubeconfig \\
+## 证书的位置
+  --cert-dir=/opt/k8s/cert \\
+## 管理kubelet文件（volume mount, etc.）
+  --root-dir=${K8S_DIR}/kubelet \\
+
+# 以下在1.21中将被移除随着docker shim
+#  --network-plugin=cni \\
+#  --cni-conf-dir=/etc/cni/net.d \\
+#  --image-pull-progress-deadline=15m \\
+
+## 使用containerd runtime的选项
+  --container-runtime=remote \\
+  --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \\
+
+
+  --kubeconfig=/opt/k8s/conf/kubelet.kubeconfig \\
+  --config=/opt/k8s/conf/kubelet-config.yaml \\
+  --hostname-override=##NODE_NAME## \\
+  --node-ip=##NODE_IP## \\
+
+## 以下将移到config中
+#  --volume-plugin-dir=${K8S_DIR}/kubelet/kubelet-plugins/volume/exec/ \\
+  --logtostderr=true \\
+  --v=2
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 为各节点创建和分发 kubelet systemd unit 文件：
+for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+    gecho ">>> 为各节点创建和分发 kubelet systemd unit 文件 ${node_name}"
+    sed -e "s/##NODE_NAME##/${NODE_NAMES[i]}/" -e "s/##NODE_IP##/${NODE_IPS[i]}/" -e "/^[ ]*#.*$/d" -e "/^[ ]*$/d" ${WORK_DIR}/kubelet.service.template > ${WORK_DIR}/kubelet-${NODE_NAMES[i]}.service
+    scp ${WORK_DIR}/kubelet-${NODE_NAMES[i]}.service root@${NODE_IPS[i]}:/etc/systemd/system/kubelet.service
+  done
+
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ )); do
+    gecho ">>> 为各节点创建和分发 kubelet systemd unit 文件 ${node_name}"
+    sed -e "s/##NODE_NAME##/${MASTER_NAMES[i]}/" -e "s/##NODE_IP##/${MASTER_IPS[i]}/" -e "/^[ ]*#.*$/d" -e "/^[ ]*$/d" ${WORK_DIR}/kubelet.service.template > ${WORK_DIR}/kubelet-${MASTER_NAMES[i]}.service
+    scp ${WORK_DIR}/kubelet-${MASTER_NAMES[i]}.service root@${MASTER_IPS[i]}:/etc/systemd/system/kubelet.service
+  done 
+ 
+# 启动 kubelet 服务
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+    gecho ">>> 启动 kubelet 服务 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p ${K8S_DIR}/kubelet/kubelet-plugins/volume/exec/"
+    ssh root@${node_ip} "/usr/sbin/swapoff -a"
+    ssh root@${node_ip} "systemctl daemon-reload && systemctl enable kubelet && systemctl restart kubelet"
+    sleep 5
+	
+    gecho ">>> 检查服务运行状态 ${node_ip}"
+    ssh root@${node_ip} "systemctl status kubelet | grep Active"
+  done
+}
+
+###########################################################
+# 授予 kube-apiserver 访问 kubelet API 的权限
+###########################################################
+function kubelet_csr(){
+gecho ">>> 授予 kube-apiserver 访问 kubelet API 的权限..."
+kubectl create clusterrolebinding kube-apiserver:kubelet-apis --clusterrole=system:kubelet-api-admin --user kubernetes-master
+gecho ">>> 绑定 group system:bootstrappers 和 clusterrole system:node-bootstrapper..."
+kubectl create clusterrolebinding kubelet-bootstrap --clusterrole=system:node-bootstrapper --group=system:bootstrappers
+
+# 为 kubelet client 证书的自动 approve CSR 请求生成 ClusterRoleBinding
+gecho ">>> 为 kubelet client 证书的自动 approve CSR 请求生成 ClusterRoleBinding ..."
+cat > ${WORK_DIR}/csr-crb.yaml <<EOF
+# Approve all CSRs for the group "system:bootstrappers"
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: auto-approve-csrs-for-group
+subjects:
+- kind: Group
+  name: system:bootstrappers
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
+  apiGroup: rbac.authorization.k8s.io
+---
+# To let a node of the group "system:nodes" renew its own credentials
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: node-client-cert-renewal
+subjects:
+- kind: Group
+  name: system:nodes
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:certificates.k8s.io:certificatesigningrequests:selfnodeclient
+  apiGroup: rbac.authorization.k8s.io
+---
+# A ClusterRole which instructs the CSR approver to approve a node requesting a
+# serving cert matching its client cert.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  #name: approve-node-server-renewal-csr
+  name: system:certificates.k8s.io:certificatesigningrequests:selfnodeserver
+rules:
+- apiGroups: ["certificates.k8s.io"]
+  resources: ["certificatesigningrequests/selfnodeserver"]
+  verbs: ["create"]
+---
+# To let a node of the group "system:nodes" renew its own server credentials
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: node-server-cert-renewal
+subjects:
+- kind: Group
+  name: system:nodes
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  #name: approve-node-server-renewal-csr
+  name: system:certificates.k8s.io:certificatesigningrequests:selfnodeserver
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+if kubectl apply -f ${WORK_DIR}/csr-crb.yaml; then
+  gecho ">>> 自动 approve CSR 成功..."
+else
+  recho "自动 approve CSR 失败！"
+  exit 1
+fi
+}
+
+####################################################################
+#              创建和分发 kubelet systemd unit 文件 for docker     #
+####################################################################
+# 创建 kubelet systemd unit 文件模板：
+#  --runtime-cgroups=/systemd/system.slice \\
+#  --kubelet-cgroups=/systemd/system.slice \\
+kubelet_systemd_for_docker(){
+cat > ${WORK_DIR}/kubelet.service.template <<EOF
+[Unit]
+Description=Kubernetes Kubelet
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+After=docker.service
+Requires=docker.service
+[Service]
+WorkingDirectory=${K8S_DIR}/kubelet
+ExecStart=/opt/k8s/bin/kubelet \\
+  --hostname-override=##NODE_NAME## \\
+  --node-ip=##NODE_IP## \\
+  --bootstrap-kubeconfig=/opt/k8s/conf/kubelet-bootstrap.kubeconfig \\
+  --cert-dir=/opt/k8s/cert \\
+  --root-dir=${K8S_DIR}/kubelet \\
+  --kubeconfig=/opt/k8s/conf/kubelet.kubeconfig \\
+  --config=/opt/k8s/conf/kubelet-config.yaml \\
+  --network-plugin=cni \\
+  --cni-conf-dir=/etc/cni/net.d \\
+  --pod-infra-container-image=registry.cn-beijing.aliyuncs.com/leooo/pause:3.6 \\
+  --image-pull-progress-deadline=15m \\
+  --volume-plugin-dir=${K8S_DIR}/kubelet/kubelet-plugins/volume/exec/ \\
+  --logtostderr=true \\
+  --v=2
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 为各节点创建和分发 kubelet systemd unit 文件：
+for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+    gecho ">>> 为各节点创建和分发 kubelet systemd unit 文件 ${NODE_NAMES[i]}"
+    sed -e "s/##NODE_NAME##/${NODE_NAMES[i]}/" -e "s/##NODE_IP##/${NODE_IPS[i]}/" -e "/^[ ]*#.*$/d" -e "/^[ ]*$/d" ${WORK_DIR}/kubelet.service.template > ${WORK_DIR}/kubelet-${NODE_NAMES[i]}.service
+    scp ${WORK_DIR}/kubelet-${NODE_NAMES[i]}.service root@${NODE_IPS[i]}:/etc/systemd/system/kubelet.service
+  done
+
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ )); do
+    gecho ">>> 为各节点创建和分发 kubelet systemd unit 文件 ${MASTER_NAMES[i]}"
+    sed -e "s/##NODE_NAME##/${MASTER_NAMES[i]}/" -e "s/##NODE_IP##/${MASTER_IPS[i]}/" -e "/^[ ]*#.*$/d" -e "/^[ ]*$/d" ${WORK_DIR}/kubelet.service.template > ${WORK_DIR}/kubelet-${MASTER_NAMES[i]}.service
+    scp ${WORK_DIR}/kubelet-${MASTER_NAMES[i]}.service root@${MASTER_IPS[i]}:/etc/systemd/system/kubelet.service
+  done
+  
+# 启动 kubelet 服务
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+    gecho ">>> 启动 kubelet 服务 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p ${K8S_DIR}/kubelet/kubelet-plugins/volume/exec/"
+    ssh root@${node_ip} "/usr/sbin/swapoff -a"
+    ssh root@${node_ip} "systemctl daemon-reload && systemctl enable kubelet && systemctl restart kubelet"
+    sleep 5
+  
+    gecho ">>> 检查服务运行状态 ${node_ip}"
+    ssh root@${node_ip} "systemctl status kubelet | grep Active"
+  done
+}
+
+
+#############################
+#   创建 kube-proxy 证书
+#############################
+# 创建证书签名请求：
+kube-proxy_cert(){
+cat > ${WORK_DIR}/kube-proxy-csr.json <<EOF
+{
+  "CN": "system:kube-proxy",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "CN",
+      "ST": "BeiJing",
+      "L": "BeiJing",
+      "O": "k8s",
+      "OU": "${CSR_OU}"
+    }
+  ]
+}
+EOF
+	
+gecho ">>> 生成证书和私钥..."
+cfssl gencert -ca=${WORK_DIR}/ca.pem \
+  -ca-key=${WORK_DIR}/ca-key.pem \
+  -config=${WORK_DIR}/ca-config.json \
+  -profile=kubernetes  ${WORK_DIR}/kube-proxy-csr.json | cfssljson -bare ${WORK_DIR}/kube-proxy
+}
+
+####################################
+# 创建和分发 kubeconfig 文件
+####################################
+kube-proxy_kubeconfig(){
+gecho ">>> 创建kubeconfig文件..."
+kubectl config set-cluster kubernetes \
+  --certificate-authority=${WORK_DIR}/ca.pem \
+  --embed-certs=true \
+  --server=${KUBE_APISERVER} \
+  --kubeconfig=${WORK_DIR}/kube-proxy.kubeconfig
+kubectl config set-credentials kube-proxy \
+  --client-certificate=${WORK_DIR}/kube-proxy.pem \
+  --client-key=${WORK_DIR}/kube-proxy-key.pem \
+  --embed-certs=true \
+  --kubeconfig=${WORK_DIR}/kube-proxy.kubeconfig
+kubectl config set-context default \
+  --cluster=kubernetes \
+  --user=kube-proxy \
+  --kubeconfig=${WORK_DIR}/kube-proxy.kubeconfig
+kubectl config use-context default --kubeconfig=${WORK_DIR}/kube-proxy.kubeconfig
+
+# 分发 kubeconfig 文件：
+for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+    gecho ">>> 分发 kubeconfig 文件到 ${NODE_NAMES[i]}"
+    scp ${WORK_DIR}/kube-proxy.kubeconfig root@${NODE_IPS[i]}:/opt/k8s/conf
+  done
+
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ )); do     
+    gecho ">>> 分发 kubeconfig 文件到 ${MASTER_NAMES[i]}"
+    scp ${WORK_DIR}/kube-proxy.kubeconfig root@${MASTER_IPS[i]}:/opt/k8s/conf
+  done
+
+}
+
+############################################
+# 创建 kube-proxy 配置文件
+############################################
+# 从 v1.10 开始，kube-proxy 部分参数可以配置文件中配置。可以使用 --write-config-to 选项生成该配置文件，或者参考 源代码的注释。
+# 创建 kube-proxy config 文件模板：
+
+kube-proxy_config(){
+cat > ${WORK_DIR}/kube-proxy-config.yaml.template <<EOF
+kind: KubeProxyConfiguration
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+clientConnection:
+  burst: 200
+  kubeconfig: "/opt/k8s/conf/kube-proxy.kubeconfig"
+  qps: 100
+bindAddress: ##NODE_IP##
+healthzBindAddress: ##NODE_IP##:10256
+metricsBindAddress: ##NODE_IP##:10249
+enableProfiling: true
+clusterCIDR: ${CLUSTER_CIDR}
+hostnameOverride: ##NODE_NAME##
+#mode: "ipvs"
+#portRange: ""
+iptables:
+ masqueradeAll: false
+#ipvs:
+#  scheduler: rr
+#  excludeCIDRs: []
+EOF
+
+    # 为各节点创建和分发 kube-proxy 配置文件：
+    for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+        gecho ">>> 为各节点创建和分发 kube-proxy 配置文件：${NODE_NAMES[i]}"
+        sed -e "s/##NODE_NAME##/${NODE_NAMES[i]}/" -e "s/##NODE_IP##/${NODE_IPS[i]}/" \
+            ${WORK_DIR}/kube-proxy-config.yaml.template > ${WORK_DIR}/kube-proxy-config-${NODE_NAMES[i]}.yaml.template
+        scp ${WORK_DIR}/kube-proxy-config-${NODE_NAMES[i]}.yaml.template root@${NODE_IPS[i]}:/opt/k8s/conf/kube-proxy-config.yaml
+    done
+
+    for (( i=0; i < "${#MASTER_IPS[@]}"; i++ )); do
+        gecho ">>> 为各节点创建和分发 kube-proxy 配置文件：${MASTER_NAMES[i]}"
+        sed -e "s/##NODE_NAME##/${MASTER_NAMES[i]}/" -e "s/##NODE_IP##/${MASTER_IPS[i]}/" \
+            ${WORK_DIR}/kube-proxy-config.yaml.template > ${WORK_DIR}/kube-proxy-config-${MASTER_NAMES[i]}.yaml.template
+        scp ${WORK_DIR}/kube-proxy-config-${MASTER_NAMES[i]}.yaml.template root@${MASTER_IPS[i]}:/opt/k8s/conf/kube-proxy-config.yaml
+    done
+}
+
+###################################################
+# 创建和分发 kube-proxy systemd unit 文件
+###################################################
+kube-proxy_systemd(){
+cat > ${WORK_DIR}/kube-proxy.service.template <<EOF
+[Unit]
+Description=Kubernetes Kube-Proxy Server
+Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+After=network.target
+[Service]
+WorkingDirectory=${K8S_DIR}/kube-proxy
+ExecStart=/opt/k8s/bin/kube-proxy \\
+  --config=/opt/k8s/conf/kube-proxy-config.yaml \\
+  --logtostderr=true \\
+  --v=2
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 分发 kube-proxy systemd unit 文件：
+sed -e "/^[ ]*#.*$/d" ${WORK_DIR}/kube-proxy.service.template > ${WORK_DIR}/kube-proxy.service
+
+for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+    gecho ">>> 分发 kube-proxy systemd unit 文件 ${NODE_NAMES[i]}"
+    scp ${WORK_DIR}/kube-proxy.service root@${NODE_IPS[i]}:/etc/systemd/system/
+  done
+
+for (( i=0; i < "${#MASTER_IPS[@]}"; i++ )); do
+    gecho ">>> 分发 kube-proxy systemd unit 文件 ${MASTER_NAMES[i]}"
+    scp ${WORK_DIR}/kube-proxy.service root@${MASTER_IPS[i]}:/etc/systemd/system/
+  done
+
+# 启动 kube-proxy 服务
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do
+    gecho ">>> 启动 kube-proxy 服务 ${node_ip}"
+    ssh root@${node_ip} "mkdir -p ${K8S_DIR}/kube-proxy"
+    ssh root@${node_ip} "modprobe ip_vs_rr"
+    ssh root@${node_ip} "systemctl daemon-reload && systemctl enable kube-proxy && systemctl restart kube-proxy"
+done
+sleep 5
+
+for node_ip in ${NODE_IPS[@]} ${MASTER_IPS[@]}; do	
+    gecho ">>> 检查启动结果 ${node_ip}"
+    ssh root@${node_ip} "systemctl status kube-proxy|grep Active"
+done
+}
+
+
+#-------------------------------------------添加新节点模块-----------------------------------------------
+############################################
+# 添加新的节点，复制CA文件到 node
+############################################
+function add_ca(){
+    for node_ip in ${NODE_IPS[@]}; do
+        gecho ">>> 复制以下文件到${node_ip}"
+        ssh root@${node_ip} "mkdir -p /opt/k8s/cert"
+        scp ${WORK_DIR}/ca.pem root@${node_ip}:/opt/k8s/cert
+    done
+}
+
+########################################################
+# 添加节点，创建和分发 containerd 配置文件
+#########################################################
+# 分发二进制文件到所有 worker 节点：
+function add_containerd(){
+    for node_ip in ${NODE_IPS[@]}; do
+        ssh root@${node_ip} "mkdir /opt/cni/bin -p && mkdir /opt/containerd/{bin,lib} /etc/cni/net.d /etc/containerd ${CONTAINERD_DIR}/{root,state} -p"
+
+        gecho ">>> 分发 containerd and cni 等二进制文件到 worker 节点 ${node_ip}"
+        scp ${WORK_DIR}/containerd/bin/* ${WORK_DIR}/crictl ${WORK_DIR}/runc root@${node_ip}:/opt/containerd/bin
+
+        gecho ">>> 分发 cni plugin 二进制文件到 ${node_ip}"
+        scp ${WORK_DIR}/cni-plugins/* root@${node_ip}:/opt/cni/bin
+        ssh root@${node_ip} "chmod a+x /opt/k8s/bin/*"
+
+        # 创建和分发 crictl 配置文件	
+        gecho ">>> 分发 crictl.yaml 到 worker 节点 ${node_ip}"
+        scp ${WORK_DIR}/crictl.yaml root@${node_ip}:/etc/crictl.yaml
+
+        # 分发 containerd 配置文件
+        gecho ">>> 分发 containerd 配置文件 ${node_ip}"
+        scp ${WORK_DIR}/containerd-config.toml root@${node_ip}:/etc/containerd/config.toml
+
+        # 分发 systemd unit 文件，启动 containerd 服务
+        gecho ">>> 分发 systemd unit 文件，启动 containerd 服务 ${node_ip}"
+        scp ${WORK_DIR}/containerd.service root@${node_ip}:/etc/systemd/system
+
+        gecho ">>> 启动 containerd 服务 ${node_ip}"
+        ssh root@${node_ip} "systemctl enable containerd && systemctl restart containerd"
+        sleep 5
+
+        gecho ">>> 检查 containerd 服务运行状态 ${node_ip}"
+        ssh root@${node_ip} "systemctl status containerd | grep Active"
+    done
+}
+
+#############################################################
+# 添加节点，创建和分发 Docker 文件
+#############################################################
+# 分发|启动|检查 docker 配置文件到所有 worker 节点：
+function add_docker(){
+    for node_ip in ${NODE_IPS[@]}; do
+        ssh root@${node_ip} "mkdir /etc/cni/net.d /opt/dockerd/bin /opt/cni/bin /etc/docker/ ${DOCKER_DIR}/{data,exec} -p"
+
+        gecho ">>> 分发 docker 二进制文件到 ${node_ip}"
+        scp ${WORK_DIR}/docker/*  root@${node_ip}:/opt/dockerd/bin
+
+        gecho ">>> 分发 cni plugin 二进制文件到 ${node_ip}"
+        scp ${WORK_DIR}/cni-plugins/* root@${node_ip}:/opt/cni/bin
+        ssh root@${node_ip} "chmod +x /opt/k8s/bin/* /opt/cni/bin/*"
+
+        gecho ">>> 分发 docker systemd 文件到 ${node_ip}"
+        sed -i -e "s|##DOCKER_DIR##|${DOCKER_DIR}|" ${WORK_DIR}/docker.service
+        scp ${WORK_DIR}/docker.service root@${node_ip}:/etc/systemd/system/
+
+        gecho ">>> 分发 docker 配置文件到 ${node_ip}"
+        scp ${WORK_DIR}/docker-daemon.json root@${node_ip}:/etc/docker/daemon.json
+
+        gecho ">>> 启动 docker 服务 ${node_ip}"
+        ssh root@${node_ip} "systemctl daemon-reload && systemctl enable docker && systemctl restart docker"
+        sleep 5
+
+        gecho ">>> 检查 docker 服务运行状态 ${node_ip}"
+        ssh root@${node_ip} "systemctl status docker|grep Active"
+    done
+}
+
+###################################################################
+# 分发 kubelet 二进制文件和创建 kubelet bootstrap kubeconfig 文件   #
+###################################################################
+function add_kubelet(){
+    for node_ip in ${NODE_IPS[@]}; do
+        gecho ">>> 分发 kubelet 二进制文件 ${node_ip}"
+        scp ${WORK_DIR}/kubernetes/server/bin/{kube-proxy,kubelet,mounter} root@${node_ip}:/opt/k8s/bin/
+        ssh root@${node_ip} "chmod +x /opt/k8s/bin/*"
+    done
+
+    if [ ! $? -eq 0 ]; then
+        recho ">>> 分发文件失败，请检查文件是否存在!"
+        exit 1
+    fi
+
+    # 创建 kubelet bootstrap kubeconfig 文件
+    for node_name in ${NODE_NAMES[@]}; do
+        gecho ">>> 创建 kubelet bootstrap kubeconfig 文件${node_name}"
+        # 创建 token
+        while true; do 
+            TOKEN_ID=$(head -c 6 /dev/urandom | md5sum | head -c 6)
+            TOKEN_SECRET=$(head -c 16 /dev/urandom | md5sum | head -c 16)
+            TMP_TOKEN_ID=$(echo "$TOKEN_ID" | tr -dc a-z)
+            if [ -n "$TMP_TOKEN_ID" ]; then 
+                break
+            fi
+        done
+        BOOTSTRAP_TOKEN=${TOKEN_ID}.${TOKEN_SECRET}
+        sed -e "s/##TOKEN_ID##/${TOKEN_ID}/" -e "s/##TOKEN_SECRET##/${TOKEN_SECRET}/" ${WORK_DIR}/bootstrap_token.yaml.template > ${WORK_DIR}/bootstrap_token_${TOKEN_ID}.yaml
+        kubectl apply -f ${WORK_DIR}/bootstrap_token_${TOKEN_ID}.yaml
+    # 设置集群参数
+        kubectl config set-cluster kubernetes \
+        --certificate-authority=/opt/k8s/cert/ca.pem \
+        --embed-certs=true \
+        --server=${KUBE_APISERVER} \
+        --kubeconfig=${WORK_DIR}/kubelet-bootstrap-${node_name}.kubeconfig
+    # 设置客户端认证参数
+        kubectl config set-credentials kubelet-bootstrap \
+        --token=${BOOTSTRAP_TOKEN} \
+        --kubeconfig=${WORK_DIR}/kubelet-bootstrap-${node_name}.kubeconfig
+    # 设置上下文参数
+        kubectl config set-context default \
+        --cluster=kubernetes \
+        --user=kubelet-bootstrap \
+        --kubeconfig=${WORK_DIR}/kubelet-bootstrap-${node_name}.kubeconfig
+    # 设置默认上下文
+        kubectl config use-context default --kubeconfig=${WORK_DIR}/kubelet-bootstrap-${node_name}.kubeconfig
+    done
+
+    # 分发 bootstrap kubeconfig 文件到所有 worker 节点
+    for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+        gecho ">>> 分发 bootstrap kubeconfig 文件到 worker 节点 ${NODE_NAMES[i]}"
+        scp ${WORK_DIR}/kubelet-bootstrap-${NODE_NAMES[i]}.kubeconfig root@${NODE_IPS[i]}:/opt/k8s/conf/kubelet-bootstrap.kubeconfig
+    done
+
+    # 分发 kubelet 配置文件：
+    for node_ip in ${NODE_IPS[@]}; do 
+        gecho ">>> 为各节点创建和分发 kubelet 配置文件 ${node_ip}"
+        sed -e "s/##NODE_IP##/${node_ip}/" ${WORK_DIR}/kubelet-config.yaml.template > ${WORK_DIR}/kubelet-config-${node_ip}.yaml.template
+        scp ${WORK_DIR}/kubelet-config-${node_ip}.yaml.template root@${node_ip}:/opt/k8s/conf/kubelet-config.yaml
+    done
+
+    # 为各节点创建和分发 kubelet systemd unit 文件：
+    for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+        gecho ">>> 为各节点创建和分发 kubelet systemd unit 文件 ${NODE_NAMES[i]}"
+        sed -e "s/##NODE_NAME##/${NODE_NAMES[i]}/" ${WORK_DIR}/kubelet.service.template > ${WORK_DIR}/kubelet-${NODE_NAMES[i]}.service
+        scp ${WORK_DIR}/kubelet-${NODE_NAMES[i]}.service root@${NODE_IPS[i]}:/etc/systemd/system/kubelet.service
+    done
+
+    # 启动 kubelet 服务
+    for node_ip in ${NODE_IPS[@]}; do
+        gecho ">>> 启动 kubelet 服务 ${node_ip}"
+        ssh root@${node_ip} "mkdir -p ${K8S_DIR}/kubelet/kubelet-plugins/volume/exec/"
+        ssh root@${node_ip} "/usr/sbin/swapoff -a"
+        ssh root@${node_ip} "systemctl daemon-reload && systemctl enable kubelet && systemctl restart kubelet"
+        sleep 5
+        
+        gecho ">>> 检查服务运行状态 ${node_ip}"
+        ssh root@${node_ip} "systemctl status kubelet | grep Active"
+    done
+}
+
+#################################################################
+# 创建和分发 kube-proxy 的 kubeconfig 文件                        #
+#################################################################
+function add_kube-proxy(){
+    for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+        gecho ">>> 分发 kubeconfig 文件到 ${NODE_NAMES[i]}"
+        scp ${WORK_DIR}/kube-proxy.kubeconfig root@${NODE_IPS[i]}:/opt/k8s/conf
+    done
+
+    # 为各节点创建和分发 kube-proxy 配置文件：
+    for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+        gecho ">>> 为各节点创建和分发 kube-proxy 配置文件：${NODE_NAMES[i]}"
+        sed -e "s/##NODE_NAME##/${NODE_NAMES[i]}/" -e "s/##NODE_IP##/${NODE_IPS[i]}/" ${WORK_DIR}/kube-proxy-config.yaml.template > ${WORK_DIR}/kube-proxy-config-${NODE_NAMES[i]}.yaml.template
+        scp ${WORK_DIR}/kube-proxy-config-${NODE_NAMES[i]}.yaml.template root@${NODE_IPS[i]}:/opt/k8s/conf/kube-proxy-config.yaml
+    done
+
+    # 分发 kube-proxy systemd unit 文件：
+    for (( i=0; i < "${#NODE_IPS[@]}"; i++ )); do
+        gecho ">>> 分发 kube-proxy systemd unit 文件 ${NODE_NAME[i]}"
+        scp ${WORK_DIR}/kube-proxy.service root@${NODE_IPS[i]}:/etc/systemd/system/
+    done
+
+    # 启动 kube-proxy 服务
+    for node_ip in ${NODE_IPS[@]}; do
+        gecho ">>> 启动 kube-proxy 服务 ${node_ip}"
+        ssh root@${node_ip} "mkdir -p ${K8S_DIR}/kube-proxy"
+        ssh root@${node_ip} "modprobe ip_vs_rr"
+        ssh root@${node_ip} "systemctl daemon-reload && systemctl enable kube-proxy && systemctl restart kube-proxy"
+
+         # 检查启动结果
+        gecho ">>> 检查启动结果 ${node_ip}"
+        ssh root@${node_ip} "systemctl status kube-proxy|grep Active"
+    done
+}
+
+
+#######################################################################################
+#                          集群清理模块 clean all cluster
+#######################################################################################
+function clean_cluster(){
+    read -p "are yo sure clean the k8s cluster:[YES](input any key for exit...)" switch
+    case ${switch} in
+    YES)
+        IPS=(${MASTER_IPS[@]} ${NODE_IPS[@]} ${ETCD_IPS[@]} ${NEW_NODE_IPS[@]})
+        # remove the duplicates ips
+        for (( i=0; i < "${#IPS[@]}"; i++ )); do
+            switch=no
+            for (( j=$[i+1]; j< "${#IPS[@]}"; j++ )); do
+                if [ ${IPS[i]} = ${IPS[j]} ]; then
+                switch=yes
+                fi
+            done
+
+            if [ "$switch" = no ]; then
+                RM_IPS[${#RM_IPS[*]}]=${IPS[i]}
+            fi
+        done
+
+        for node_ip in ${RM_IPS[@]}; do
+            gecho ">>> clean host ${node_ip}"
+
+            #停容器进程：
+            #  killall -9 containerd-shim-runc-v1 pause
+            echo "stop container..."
+            ssh root@${node_ip} "/opt/containerd/bin/crictl ps -q | xargs /opt/containerd/bin/crictl stop >/dev/null 2>&1"  
+            echo "stop docker..."
+            ssh root@${node_ip} "systemctl disable docker --now >/dev/null 2>&1" 
+            echo "stop kube-proxy..."
+            ssh root@${node_ip} "systemctl disable kube-proxy --now >/dev/null 2>&1"
+            echo "stop kube-kubelet..."
+            ssh root@${node_ip} "systemctl disable kube-kubelet --now >/dev/null 2>&1"
+            echo "stop containerd..."
+            ssh root@${node_ip} "systemctl disable containerd --now >/dev/null 2>&1"
+            echo "stop kube-controller-manager..."
+            ssh root@${node_ip} "systemctl disable kube-controller-manager.service --now >/dev/null 2>&1"
+            echo "stop kube-scheduler..."
+            ssh root@${node_ip} "systemctl disable kube-scheduler.service --now >/dev/null 2>&1"
+            echo "stop kube-apiserver..."
+            ssh root@${node_ip} "systemctl disable kube-apiserver.service --now >/dev/null 2>&1"
+            echo "stop etcd..."
+            ssh root@${node_ip} "systemctl disable etcd --now >/dev/null 2>&1"
+
+            # umount k8s 挂载的目录
+            echo "stop the mounting..."
+            ssh root@${node_ip} "mount |grep -E 'kubelet|cni|containerd' | awk '{print $3}'|xargs umount >/dev/null 2>&1"
+
+            # 删除 systemd unit 文件
+            echo "clear the system files...."
+            ssh root@${node_ip} "sudo rm -rf /etc/systemd/system/{kubelet,kube-proxy,containerd,docker,kube-controller-manager,kube-scheduler,kube-apiserver}.service >/dev/null 2>&1"
+
+            # 删除  目录 
+            echo "clear the directoris and files..."
+            ssh root@${node_ip} "sudo rm -rf ${DOCKER_DIR} ${K8S_DIR} ${CONTAINERD_DIR} ${ETCD_DATA_DIR} ${ETCD_WAL_DIR} ${WORK_DIR} /opt/k8s/ /opt/dockerd /opt/cni /opt/containerd /etc/cni/net.d ~/.kube/config >/dev/null 2>&1"
+            # 清理 kube-proxy 和 calico 创建的 iptables：
+            echo "clean the iptables..."
+            ssh root@${node_ip} "sudo iptables -F && sudo iptables -X && sudo iptables -F -t nat && sudo iptables -X -t nat"
+
+        done
+        ;;
+    *)
+        exit 1
+        ;;
+    esac
+}
