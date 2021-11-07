@@ -4,10 +4,9 @@ k8s二进制安装部署脚本
 - centos 7
 - centos 8
 - ubuntu 18.x
-### 使用帮助
+### 使用帮助 
 ```
 Usage kubesetup.sh -f <Config_File> -c <containerd|docker|init|clean> [-a]
-
 使用说明
 -f fileanme   必选项，安装群集时使用指定的文件定义好的参数去初始化群集主机
 -c            必选项，表示cluster选项，后面跟的参数为
