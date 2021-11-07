@@ -5,6 +5,7 @@ k8s二进制安装部署脚本
 - centos 8
 - ubuntu 18.x
 ### 使用帮助
+```
 Usage kubesetup.sh -f <Config_File> -c <containerd|docker|init|clean> [-a]
 
 使用说明
@@ -16,3 +17,4 @@ Usage kubesetup.sh -f <Config_File> -c <containerd|docker|init|clean> [-a]
    clean      按照配置文件清理群集，此参数无法与 -a 配合使用
 -a            可选项，在已经安装的群集上添加新的主机
 -h            帮助
+```
