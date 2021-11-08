@@ -148,3 +148,24 @@ export GET_CALICOCTL="http://192.168.205.77/K8s/calico/${CALICOCTL}"
 export COREDNS="coredns_1.7.0_linux_amd64.tgz"
 export GET_COREDNS="http://192.168.205.77/K8s/${COREDNS}"
 ```
+### 使用列子 
+#### 使用 contaienrd 做为运行时
+```
+# bash kubesetup -f configfile -c containerd
+```
+#### 使用 docker 做为运行时
+```
+# bash kubesetup -f configfile -c docker
+```
+#### 按照配置文件批量添加节点
+```
+# bash kubesetup -f configfile -c docker -a
+```
+#### 按照配置文件中的定义主机（包括 -a 选项中的主机）清理群集
+```
+# bash kubesetup -f configfile -c clean
+```
+#### 按照配置文件中的主机进行初始化群集
+```
+# bash kubesetup -f configfile -c init
+```
